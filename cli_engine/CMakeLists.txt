@@ -14,38 +14,30 @@ if(DEFINED OPEN_CASCADE_DIR)
     target_link_libraries(StepMetricsCli PRIVATE ${OpenCASCADE_LIBRARIES})
     target_link_directories(StepMetricsCli PRIVATE "${OPEN_CASCADE_DIR}/win64/vc14/lib")
 else()
-    # System-installed OCCT (Ubuntu apt packages on Linux / Railway)
+    # System-installed OCCT (Ubuntu apt packages on Linux / Railway).
+    # apt installs headers to /usr/include/opencascade and .so files to
+    # /usr/lib/x86_64-linux-gnu — no pkg-config .pc files are shipped.
+
+    # Try cmake config first (works if OpenCASCADEConfig.cmake is on path)
+    list(APPEND CMAKE_PREFIX_PATH "/usr/lib/x86_64-linux-gnu/cmake")
     find_package(OpenCASCADE QUIET)
+
     if(OpenCASCADE_FOUND)
+        message(STATUS "Found OpenCASCADE via cmake config")
         target_include_directories(StepMetricsCli PRIVATE ${OpenCASCADE_INCLUDE_DIR})
         target_link_libraries(StepMetricsCli PRIVATE ${OpenCASCADE_LIBRARIES})
     else()
-        # Fall back to pkg-config / manual discovery for apt-installed OCCT
-        find_package(PkgConfig REQUIRED)
-        pkg_check_modules(OCCT REQUIRED
-            TKernel
-            TKMath
-            TKBRep
-            TKGeomBase
-            TKGeomAlgo
-            TKTopAlgo
-            TKMesh
-            TKBO
-            TKShHealing
-            TKSTEP
-            TKSTEP209
-            TKSTEPAttr
-            TKSTEPBase
-            TKXCAF
-            TKXDE
-            TKXDESTEP
-            TKRWMesh
-            TKLCAF
-            TKCDF
-            TKVCAF
-        )
-        target_include_directories(StepMetricsCli PRIVATE ${OCCT_INCLUDE_DIRS})
-        target_link_libraries(StepMetricsCli PRIVATE ${OCCT_LIBRARIES})
-        target_compile_options(StepMetricsCli PRIVATE ${OCCT_CFLAGS_OTHER})
+        # Direct fallback: find headers, link against library names directly.
+        # The linker finds libTK*.so in /usr/lib/x86_64-linux-gnu automatically.
+        find_path(OCCT_INCLUDE_DIR Standard.hxx
+            PATHS /usr/include/opencascade /usr/local/include/opencascade
+            REQUIRED)
+        message(STATUS "Found OCCT headers at: ${OCCT_INCLUDE_DIR}")
+
+        target_include_directories(StepMetricsCli PRIVATE ${OCCT_INCLUDE_DIR})
+        target_link_libraries(StepMetricsCli PRIVATE
+            TKernel TKMath TKBRep TKG2d TKG3d TKGeomBase TKGeomAlgo TKTopAlgo
+            TKMesh TKBO TKShHealing TKSTEP TKSTEP209 TKSTEPAttr TKSTEPBase
+            TKXCAF TKXDESTEP TKRWMesh TKLCAF TKCDF)
     endif()
 endif()
