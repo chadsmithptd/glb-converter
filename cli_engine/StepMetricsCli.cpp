@@ -20,6 +20,7 @@
 #  include <AIS_Shape.hxx>
 #  include <Aspect_DisplayConnection.hxx>
 #  include <Graphic3d_TypeOfShadingModel.hxx>
+#  include <Image_AlienPixMap.hxx>
 #  include <OpenGl_GraphicDriver.hxx>
 #  include <Quantity_Color.hxx>
 #  include <V3d_TypeOfOrientation.hxx>
@@ -40,7 +41,6 @@
 #include <GProp_GProps.hxx>
 #include <GeomAbs_SurfaceType.hxx>
 #include <IFSelect_ReturnStatus.hxx>
-#include <Image_AlienPixMap.hxx>
 #include <Interface_Static.hxx>
 #include <Message_ProgressRange.hxx>
 #include <Precision.hxx>

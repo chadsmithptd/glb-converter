@@ -37,7 +37,8 @@ else()
         target_include_directories(StepMetricsCli PRIVATE ${OCCT_INCLUDE_DIR})
         target_link_libraries(StepMetricsCli PRIVATE
             TKernel TKMath TKBRep TKG2d TKG3d TKGeomBase TKGeomAlgo TKTopAlgo
-            TKMesh TKBO TKShHealing TKSTEP TKSTEP209 TKSTEPAttr TKSTEPBase
+            TKMesh TKBO TKShHealing
+            TKXSBase TKSTEPBase TKSTEPAttr TKSTEP209 TKSTEP
             TKXCAF TKXDESTEP TKRWMesh TKLCAF TKCDF)
     endif()
 endif()
