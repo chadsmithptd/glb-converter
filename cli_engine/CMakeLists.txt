@@ -39,6 +39,6 @@ else()
             TKernel TKMath TKBRep TKG2d TKG3d TKGeomBase TKGeomAlgo TKTopAlgo
             TKMesh TKBO TKShHealing
             TKXSBase TKSTEPBase TKSTEPAttr TKSTEP209 TKSTEP
-            TKXCAF TKXDESTEP TKRWMesh TKLCAF TKCDF)
+            TKXCAF TKXDESTEPBase TKXDESTEP TKRWMesh TKLCAF TKCDF)
     endif()
 endif()
