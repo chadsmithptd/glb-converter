@@ -1,0 +1,8 @@
+node_modules/
+build/
+uploads/
+.DS_Store
+.env
+.claude/
+*.o
+*.a
