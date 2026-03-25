@@ -45,6 +45,7 @@
 #include <Message_ProgressRange.hxx>
 #include <Precision.hxx>
 #include <RWGltf_CafWriter.hxx>
+#include <Standard_Version.hxx>
 #include <STEPCAFControl_Reader.hxx>
 #include <STEPControl_Reader.hxx>
 #include <Standard_Failure.hxx>
@@ -589,9 +590,11 @@ namespace
 
         RWGltf_CafWriter writer(TCollection_AsciiString(options.outputPath.c_str()), Standard_True);
         writer.SetTransformationFormat(RWGltf_WriterTrsfFormat_Compact);
+#if OCC_VERSION_HEX >= 0x070700
         writer.SetMergeFaces(Standard_True);
         writer.SetSplitIndices16(Standard_True);
         writer.SetToEmbedTexturesInGlb(Standard_True);
+#endif
 
         TColStd_IndexedDataMapOfStringString fileInfo;
         fileInfo.Add("generator", "StepMetricsCli");
