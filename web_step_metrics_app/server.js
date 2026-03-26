@@ -90,6 +90,10 @@ function sendProcessError(res, message, err, extra = {}) {
   });
 }
 
+app.get("/", (req, res) => {
+  res.json({ ok: true, service: "glb-converter" });
+});
+
 app.get("/api/health", (req, res) => {
   const cliPath = getCliPath();
   res.json({
@@ -210,7 +214,7 @@ app.post("/api/step-thumbnail", upload.single("stepFile"), async (req, res) => {
 });
 
 const port = Number(process.env.PORT || 3000);
-app.listen(port, () => {
-  console.log(`Step Metrics Web App listening on http://localhost:${port}`);
+app.listen(port, "0.0.0.0", () => {
+  console.log(`Step Metrics Web App listening on port ${port}`);
   console.log(`CLI path: ${getCliPath()}`);
 });
