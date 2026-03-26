@@ -33,7 +33,6 @@ RUN npm install --omit=dev
 # CLI will be at this path after build
 ENV CLI_PATH=/app/build/cli_engine/StepMetricsCli
 
-# Railway injects PORT at runtime — do not hardcode it here.
-# server.js reads process.env.PORT, falling back to 3000 for local dev.
+ENV PORT=3000
 EXPOSE 3000
 CMD ["node", "server.js"]
