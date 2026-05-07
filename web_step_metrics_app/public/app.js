@@ -496,7 +496,18 @@ async function downloadGlb() {
     throw new Error(await readErrorResponse(res, "GLB export failed."));
   }
 
-  const blob = await res.blob();
+  const arrayBuffer = await res.arrayBuffer();
+
+  // GLB binary always starts with the 4-byte magic 'glTF' (0x46546C67 LE).
+  // Guard against an HTML error page being saved as .glb, which would later
+  // surface as "Unexpected token '<'" in any GLTF loader.
+  const magic = new DataView(arrayBuffer).getUint32(0, true);
+  if (arrayBuffer.byteLength < 12 || magic !== 0x46546c67) {
+    const preview = new TextDecoder().decode(arrayBuffer.slice(0, 200));
+    throw new Error(`Server returned invalid GLB (bad magic bytes). Server said: ${preview}`);
+  }
+
+  const blob = new Blob([arrayBuffer], { type: "model/gltf-binary" });
   const url = URL.createObjectURL(blob);
   const baseName = (stepFile.name || "model.step").replace(/\.(step|stp)$/i, "");
   const a = document.createElement("a");
