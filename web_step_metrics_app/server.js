@@ -139,6 +139,8 @@ app.post("/api/analyze-step", upload.single("stepFile"), async (req, res) => {
   }
 });
 
+const GLB_MAGIC = Buffer.from([0x67, 0x6c, 0x54, 0x46]); // 'glTF'
+
 app.post("/api/convert-step-to-glb", upload.single("stepFile"), async (req, res) => {
   let inputPath;
   let outputPath;
@@ -160,13 +162,23 @@ app.post("/api/convert-step-to-glb", upload.single("stepFile"), async (req, res)
     outputPath = path.join(uploadsDir, `${req.file.filename}.glb`);
     await runProcess(cliPath, ["--export-glb", inputPath, outputPath], { timeout: 240000 });
 
+    // Validate output before sending — an HTML error page saved as .glb would
+    // crash any GLTF loader with "Unexpected token '<'" on the client side.
+    const glbBuffer = await fs.promises.readFile(outputPath);
+    if (glbBuffer.length < 12 || !glbBuffer.slice(0, 4).equals(GLB_MAGIC)) {
+      cleanupFiles(inputPath, outputPath);
+      return res.status(500).json({
+        error: "CLI produced invalid GLB output (bad magic bytes or empty file)",
+        byteLength: glbBuffer.length
+      });
+    }
+
     res.setHeader("Content-Type", "model/gltf-binary");
     res.setHeader("Content-Disposition", `attachment; filename="${baseName}.glb"`);
+    res.setHeader("Content-Length", glbBuffer.length);
 
-    const stream = fs.createReadStream(outputPath);
-    stream.on("close", () => cleanupFiles(inputPath, outputPath));
-    stream.on("error", () => cleanupFiles(inputPath, outputPath));
-    stream.pipe(res);
+    cleanupFiles(inputPath, outputPath);
+    return res.end(glbBuffer);
   } catch (err) {
     cleanupFiles(inputPath, outputPath);
     if (err.statusCode) {
