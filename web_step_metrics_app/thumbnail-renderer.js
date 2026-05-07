@@ -212,10 +212,10 @@ async function renderThumbnail(stepFilePath, width, height) {
   const color = new Uint8Array(width * height * 4);
   const depth = new Float32Array(width * height).fill(1); // NDC far = 1
 
-  // Background #f4f7fb — matches frontend scene background
+  // Background #0d0d0d
   for (let i = 0, n = width * height; i < n; i++) {
     const p = i * 4;
-    color[p] = 244; color[p+1] = 247; color[p+2] = 251; color[p+3] = 255;
+    color[p] = 13; color[p+1] = 13; color[p+2] = 13; color[p+3] = 255;
   }
 
   // ── Rasterise ────────────────────────────────────────────────────────────────
