@@ -5,6 +5,7 @@ const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
 require("dotenv").config();
+const { renderThumbnail } = require("./thumbnail-renderer");
 
 const app = express();
 app.use(cors());
@@ -190,38 +191,27 @@ app.post("/api/convert-step-to-glb", upload.single("stepFile"), async (req, res)
 
 app.post("/api/step-thumbnail", upload.single("stepFile"), async (req, res) => {
   let inputPath;
-  let pngPath;
 
   try {
     ensureStepUpload(req.file);
     inputPath = req.file.path;
 
-    const cliPath = getCliPath();
-    if (!fs.existsSync(cliPath)) {
-      cleanupFiles(inputPath);
-      return res.status(500).json({
-        error: "StepMetricsCli not found. Set CLI_PATH in env.",
-        cliPath
-      });
-    }
-
-    const width = parseDimension(req.body?.width, 500);
+    const width  = parseDimension(req.body?.width,  500);
     const height = parseDimension(req.body?.height, 500);
-    pngPath = path.join(uploadsDir, `${req.file.filename}.png`);
 
-    await runProcess(cliPath, ["--thumbnail", inputPath, pngPath, String(width), String(height)], { timeout: 240000 });
+    const pngBuffer = await renderThumbnail(inputPath, width, height);
 
-    const image = await fs.promises.readFile(pngPath);
     res.setHeader("Content-Type", "image/png");
     res.setHeader("Cache-Control", "no-store");
-    return res.send(image);
+    res.setHeader("Content-Length", pngBuffer.length);
+    return res.send(pngBuffer);
   } catch (err) {
     if (err.statusCode) {
       return res.status(err.statusCode).json({ error: err.message });
     }
-    return sendProcessError(res, "Thumbnail generation failed", err, { cliPath: getCliPath() });
+    return res.status(500).json({ error: "Thumbnail generation failed", details: err.message });
   } finally {
-    cleanupFiles(inputPath, pngPath);
+    cleanupFiles(inputPath);
   }
 });
 
