@@ -191,7 +191,7 @@ async function renderThumbnail(stepFilePath, width, height) {
   const fovX   = 2 * Math.atan(Math.tan(fovY / 2) * aspect);
 
   // Exact distance so the bounding sphere just fits inside both FOV axes, +5% margin
-  const fitDist = Math.max(bsRadius / Math.tan(fovY / 2), bsRadius / Math.tan(fovX / 2)) * 1.05;
+  const fitDist = Math.max(bsRadius / Math.tan(fovY / 2), bsRadius / Math.tan(fovX / 2)) * 1.10;
 
   // Camera direction is unnormalised [1, 0.816, 1]; scale so ‖eye−center‖ = fitDist
   const dirLen   = Math.sqrt(1 + 0.816*0.816 + 1);
