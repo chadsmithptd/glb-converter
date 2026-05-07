@@ -479,7 +479,7 @@ function createStepFormData(stepFile, extraFields = {}) {
 }
 
 function getThumbnailSize() {
-  return { width: 500, height: 500 };
+  return { width: 500, height: 400 };
 }
 
 
