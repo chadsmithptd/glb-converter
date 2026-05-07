@@ -207,22 +207,25 @@ async function renderThumbnail(stepFilePath, width, height) {
 
   const lightDir = norm3([0.6, 0.9, 0.7]);
 
-  // ── Buffers ──────────────────────────────────────────────────────────────────
+  // ── Buffers (2× supersampling — render at double resolution, downsample after) ─
 
-  const color = new Uint8Array(width * height * 4);
-  const depth = new Float32Array(width * height).fill(1); // NDC far = 1
+  const W = width  * 2;
+  const H = height * 2;
+
+  const color = new Uint8Array(W * H * 4);
+  const depth = new Float32Array(W * H).fill(1); // NDC far = 1
 
   // Background #0d0d0d
-  for (let i = 0, n = width * height; i < n; i++) {
+  for (let i = 0, n = W * H; i < n; i++) {
     const p = i * 4;
     color[p] = 13; color[p+1] = 13; color[p+2] = 13; color[p+3] = 255;
   }
 
   // ── Rasterise ────────────────────────────────────────────────────────────────
 
-  // NDC → pixels; Y inverted (NDC +1 = top → row 0)
+  // NDC → pixels at 2× resolution; Y inverted (NDC +1 = top → row 0)
   function toScreen([nx, ny, nz]) {
-    return [(nx*0.5+0.5)*width, (0.5-ny*0.5)*height, nz];
+    return [(nx*0.5+0.5)*W, (0.5-ny*0.5)*H, nz];
   }
 
   const [BR, BG, BB] = [134, 134, 134]; // #868686
@@ -239,14 +242,31 @@ async function renderThumbnail(stepFilePath, width, height) {
 
     const diff = Math.max(0, dot3(n, lightDir));
     const lit  = Math.min(1, 0.4 + 0.65 * diff);
-    rasterTri(color, depth, width, height, sp0, sp1, sp2,
+    rasterTri(color, depth, W, H, sp0, sp1, sp2,
       [Math.round(BR*lit), Math.round(BG*lit), Math.round(BB*lit)]);
+  }
+
+  // ── Downsample 2×2 → 1 pixel ─────────────────────────────────────────────────
+
+  const final = new Uint8Array(width * height * 4);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      let r=0, g=0, b=0, a=0;
+      for (let sy = 0; sy < 2; sy++) {
+        for (let sx = 0; sx < 2; sx++) {
+          const s = ((y*2+sy) * W + (x*2+sx)) * 4;
+          r += color[s]; g += color[s+1]; b += color[s+2]; a += color[s+3];
+        }
+      }
+      const d = (y * width + x) * 4;
+      final[d] = r>>2; final[d+1] = g>>2; final[d+2] = b>>2; final[d+3] = a>>2;
+    }
   }
 
   // ── Encode PNG ───────────────────────────────────────────────────────────────
 
   const png = new PNG({ width, height });
-  png.data = Buffer.from(color);
+  png.data = Buffer.from(final);
   return PNG.sync.write(png);
 }
 
