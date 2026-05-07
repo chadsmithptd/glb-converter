@@ -178,17 +178,30 @@ async function renderThumbnail(stepFilePath, width, height) {
 
   // ── Camera ──────────────────────────────────────────────────────────────────
 
-  const cx   = (minX+maxX)/2;
-  const cy   = (minY+maxY)/2;
-  const cz   = (minZ+maxZ)/2;
-  const size = Math.max(maxX-minX, maxY-minY, maxZ-minZ) || 1;
-  const dist = size * 0.9;
+  const cx = (minX+maxX)/2;
+  const cy = (minY+maxY)/2;
+  const cz = (minZ+maxZ)/2;
+  const dx = maxX-minX, dy = maxY-minY, dz = maxZ-minZ;
+
+  // Bounding-sphere radius — guarantees the whole part fits regardless of shape
+  const bsRadius = Math.sqrt(dx*dx + dy*dy + dz*dz) / 2 || 1;
+
+  const fovY   = 45 * Math.PI / 180;
+  const aspect = width / height;
+  const fovX   = 2 * Math.atan(Math.tan(fovY / 2) * aspect);
+
+  // Exact distance so the bounding sphere just fits inside both FOV axes, +5% margin
+  const fitDist = Math.max(bsRadius / Math.tan(fovY / 2), bsRadius / Math.tan(fovX / 2)) * 1.05;
+
+  // Camera direction is unnormalised [1, 0.816, 1]; scale so ‖eye−center‖ = fitDist
+  const dirLen   = Math.sqrt(1 + 0.816*0.816 + 1);
+  const distParam = fitDist / dirLen;
 
   // Fixed 45° azimuth, ~35° elevation — consistent isometric-like angle
-  const eye    = [cx + dist, cy + dist * 0.816, cz + dist];
-  const target = [cx, cy + size * 0.1, cz];
+  const eye    = [cx + distParam, cy + distParam * 0.816, cz + distParam];
+  const target = [cx, cy, cz];
   const mvp    = mat4Mul(
-    perspectiveMat(45 * Math.PI / 180, width / height, dist * 0.01, dist * 10),
+    perspectiveMat(fovY, aspect, fitDist * 0.01, fitDist * 10),
     lookAtMat(eye, target, [0, 1, 0])
   );
 
