@@ -182,11 +182,11 @@ async function renderThumbnail(stepFilePath, width, height) {
   const cy   = (minY+maxY)/2;
   const cz   = (minZ+maxZ)/2;
   const size = Math.max(maxX-minX, maxY-minY, maxZ-minZ) || 1;
-  const dist = size * 1.6;
+  const dist = size * 0.9;
 
   // Fixed 45° azimuth, ~35° elevation — consistent isometric-like angle
   const eye    = [cx + dist, cy + dist * 0.816, cz + dist];
-  const target = [cx, cy + size * 0.15, cz];
+  const target = [cx, cy + size * 0.1, cz];
   const mvp    = mat4Mul(
     perspectiveMat(45 * Math.PI / 180, width / height, dist * 0.01, dist * 10),
     lookAtMat(eye, target, [0, 1, 0])
