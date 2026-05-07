@@ -225,7 +225,7 @@ async function renderThumbnail(stepFilePath, width, height) {
     return [(nx*0.5+0.5)*width, (0.5-ny*0.5)*height, nz];
   }
 
-  const [BR, BG, BB] = [106, 141, 179]; // #6a8db3 — matches frontend default face colour
+  const [BR, BG, BB] = [134, 134, 134]; // #868686
 
   for (const { p0, p1, p2, n } of tris) {
     const sp0 = toScreen(transformPoint(mvp, p0));
