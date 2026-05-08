@@ -196,10 +196,9 @@ app.post("/api/step-thumbnail", upload.single("stepFile"), async (req, res) => {
     ensureStepUpload(req.file);
     inputPath = req.file.path;
 
-    const width  = parseDimension(req.body?.width,  500);
-    const height = parseDimension(req.body?.height, 400);
+    const width = parseDimension(req.body?.width, 500);
 
-    const pngBuffer = await renderThumbnail(inputPath, width, height);
+    const pngBuffer = await renderThumbnail(inputPath, width);
 
     res.setHeader("Content-Type", "image/png");
     res.setHeader("Cache-Control", "no-store");

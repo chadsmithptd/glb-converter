@@ -124,7 +124,8 @@ function rotX90(x, y, z) { return [x, z, -y]; }
 
 // ─── Main export ─────────────────────────────────────────────────────────────
 
-async function renderThumbnail(stepFilePath, width, height) {
+async function renderThumbnail(stepFilePath, width) {
+  const height = Math.round(width * 3 / 4);
   const occt   = await getOcctModule();
   const result = occt.ReadStepFile(new Uint8Array(fs.readFileSync(stepFilePath)), null);
 
@@ -190,8 +191,8 @@ async function renderThumbnail(stepFilePath, width, height) {
   const aspect = width / height;
   const fovX   = 2 * Math.atan(Math.tan(fovY / 2) * aspect);
 
-  // Exact distance so the bounding sphere just fits inside both FOV axes, +5% margin
-  const fitDist = Math.max(bsRadius / Math.tan(fovY / 2), bsRadius / Math.tan(fovX / 2)) * 1.05;
+  // Exact distance so the bounding sphere just fits inside both FOV axes, +8% margin
+  const fitDist = Math.max(bsRadius / Math.tan(fovY / 2), bsRadius / Math.tan(fovX / 2)) * 1.08;
 
   // Camera direction is unnormalised [1, 0.816, 1]; scale so ‖eye−center‖ = fitDist
   const dirLen   = Math.sqrt(1 + 0.816*0.816 + 1);
