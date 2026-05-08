@@ -177,6 +177,30 @@ async function renderThumbnail(stepFilePath, width) {
 
   if (tris.length === 0) throw new Error("No renderable triangles");
 
+  // If the part's longest axis is world-Y (vertical), it would appear as a
+  // standing column. Rotate 90° around Z — (x,y,z)→(−y,x,z) — so the long
+  // axis becomes world-X and the existing BL→TR logic can handle it.
+  {
+    const _dx = maxX-minX, _dy = maxY-minY, _dz = maxZ-minZ;
+    if (_dy > _dx && _dy > _dz) {
+      const rotZ90 = ([px, py, pz]) => [-py, px, pz];
+      minX = Infinity;  maxX = -Infinity;
+      minY = Infinity;  maxY = -Infinity;
+      minZ = Infinity;  maxZ = -Infinity;
+      for (const tri of tris) {
+        tri.p0 = rotZ90(tri.p0);
+        tri.p1 = rotZ90(tri.p1);
+        tri.p2 = rotZ90(tri.p2);
+        tri.n  = rotZ90(tri.n);
+        for (const p of [tri.p0, tri.p1, tri.p2]) {
+          if (p[0] < minX) minX = p[0]; if (p[0] > maxX) maxX = p[0];
+          if (p[1] < minY) minY = p[1]; if (p[1] > maxY) maxY = p[1];
+          if (p[2] < minZ) minZ = p[2]; if (p[2] > maxZ) maxZ = p[2];
+        }
+      }
+    }
+  }
+
   // ── Camera ──────────────────────────────────────────────────────────────────
 
   const cx = (minX+maxX)/2;
