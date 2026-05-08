@@ -229,7 +229,7 @@ async function renderThumbnail(stepFilePath, width) {
     return [(nx*0.5+0.5)*W, (0.5-ny*0.5)*H, nz];
   }
 
-  const [BR, BG, BB] = [134, 134, 134]; // #868686
+  const [BR, BG, BB] = [157, 157, 157]; // #9D9D9D
 
   for (const { p0, p1, p2, n } of tris) {
     const sp0 = toScreen(transformPoint(mvp, p0));
