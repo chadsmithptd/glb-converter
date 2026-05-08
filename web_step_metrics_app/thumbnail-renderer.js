@@ -194,12 +194,14 @@ async function renderThumbnail(stepFilePath, width) {
   // Exact distance so the bounding sphere just fits inside both FOV axes, +8% margin
   const fitDist = Math.max(bsRadius / Math.tan(fovY / 2), bsRadius / Math.tan(fovX / 2)) * 1.08;
 
-  // Camera direction is unnormalised [1, 0.816, 1]; scale so ‖eye−center‖ = fitDist
+  // Camera direction is unnormalised [±1, 0.816, 1]; scale so ‖eye−center‖ = fitDist
   const dirLen   = Math.sqrt(1 + 0.816*0.816 + 1);
   const distParam = fitDist / dirLen;
 
-  // Fixed 45° azimuth, ~35° elevation — consistent isometric-like angle
-  const eye    = [cx + distParam, cy + distParam * 0.816, cz + distParam];
+  // Orient 45° azimuth so the longest horizontal axis runs bottom-left → top-right.
+  // With xSign=+1 the Z axis goes BL→TR; flipping to -1 makes the X axis go BL→TR.
+  const xSign = dx > dz ? -1 : 1;
+  const eye    = [cx + xSign * distParam, cy + distParam * 0.816, cz + distParam];
   const target = [cx, cy, cz];
   const mvp    = mat4Mul(
     perspectiveMat(fovY, aspect, fitDist * 0.01, fitDist * 10),
