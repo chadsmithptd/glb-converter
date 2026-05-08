@@ -145,6 +145,7 @@ const GLB_MAGIC = Buffer.from([0x67, 0x6c, 0x54, 0x46]); // 'glTF'
 app.post("/api/convert-step-to-glb", upload.single("stepFile"), async (req, res) => {
   let inputPath;
   let outputPath;
+  let metricsPath;
 
   try {
     ensureStepUpload(req.file);
@@ -160,14 +161,22 @@ app.post("/api/convert-step-to-glb", upload.single("stepFile"), async (req, res)
     }
 
     const baseName = path.parse(req.file.originalname || "model.step").name || "model";
-    outputPath = path.join(uploadsDir, `${req.file.filename}.glb`);
-    await runProcess(cliPath, ["--export-glb", inputPath, outputPath], { timeout: 240000 });
+    outputPath  = path.join(uploadsDir, `${req.file.filename}.glb`);
+    metricsPath = path.join(uploadsDir, `${req.file.filename}.metrics.json`);
+
+    // Run GLB export and geometry analysis concurrently against the same input file.
+    const [glbResult, metricsResult] = await Promise.allSettled([
+      runProcess(cliPath, ["--export-glb", inputPath, outputPath],  { timeout: 240000 }),
+      runProcess(cliPath, [inputPath, metricsPath],                  { timeout: 120000 })
+    ]);
+
+    if (glbResult.status === "rejected") throw glbResult.reason;
 
     // Validate output before sending — an HTML error page saved as .glb would
     // crash any GLTF loader with "Unexpected token '<'" on the client side.
     const glbBuffer = await fs.promises.readFile(outputPath);
     if (glbBuffer.length < 12 || !glbBuffer.slice(0, 4).equals(GLB_MAGIC)) {
-      cleanupFiles(inputPath, outputPath);
+      cleanupFiles(inputPath, outputPath, metricsPath);
       return res.status(500).json({
         error: "CLI produced invalid GLB output (bad magic bytes or empty file)",
         byteLength: glbBuffer.length
@@ -178,10 +187,21 @@ app.post("/api/convert-step-to-glb", upload.single("stepFile"), async (req, res)
     res.setHeader("Content-Disposition", `attachment; filename="${baseName}.glb"`);
     res.setHeader("Content-Length", glbBuffer.length);
 
-    cleanupFiles(inputPath, outputPath);
+    // Attach geometry metrics as a header (best-effort — a metrics failure never
+    // blocks the GLB download).
+    if (metricsResult.status === "fulfilled") {
+      try {
+        const metricsText = await fs.promises.readFile(metricsPath, "utf8");
+        const { geometry } = JSON.parse(metricsText);
+        res.setHeader("Access-Control-Expose-Headers", "X-Part-Metrics");
+        res.setHeader("X-Part-Metrics", JSON.stringify(geometry));
+      } catch (_) { /* ignore */ }
+    }
+
+    cleanupFiles(inputPath, outputPath, metricsPath);
     return res.end(glbBuffer);
   } catch (err) {
-    cleanupFiles(inputPath, outputPath);
+    cleanupFiles(inputPath, outputPath, metricsPath);
     if (err.statusCode) {
       return res.status(err.statusCode).json({ error: err.message });
     }
