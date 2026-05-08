@@ -90,6 +90,17 @@ namespace
         }
     };
 
+    // Counts UV sample points by required tool size based on signed concave curvature.
+    // MaxCurvature() > 0 means the curvature center is on the outward-normal side →
+    // concave feature (hole, pocket, fillet) that constrains the tool radius.
+    struct ToolAccessSamples
+    {
+        int large  = 0;  // concave radius > 0.25"  (tool dia > 0.5")
+        int medium = 0;  // concave radius 0.125–0.25" (tool dia 0.25–0.5")
+        int small  = 0;  // concave radius < 0.125"  (tool dia < 0.25")
+        int total  = 0;
+    };
+
     enum class CliMode
     {
         Analyze,
@@ -229,6 +240,52 @@ namespace
                     continue;
 
                 out.add(k / lengthToInches);
+            }
+        }
+    }
+
+    // Samples concave curvature across a face's UV domain and buckets each sample
+    // by the minimum tool radius that can reach it.  Uses signed MaxCurvature():
+    //   > 0 → curvature center on the outward-normal side → concave feature
+    //   ≤ 0 → convex or flat → no tool-size constraint
+    void sampleToolAccess(const TopoDS_Face& face, double lengthToInches, ToolAccessSamples& out)
+    {
+        BRepAdaptor_Surface surf(face, Standard_True);
+        Standard_Real uMin = 0.0, uMax = 0.0, vMin = 0.0, vMax = 0.0;
+        BRepTools::UVBounds(face, uMin, uMax, vMin, vMax);
+        if (!(std::isfinite(uMin) && std::isfinite(uMax) && std::isfinite(vMin) && std::isfinite(vMax)))
+            return;
+        if (uMax <= uMin || vMax <= vMin)
+            return;
+
+        constexpr int kSteps = 5;
+        for (int iu = 0; iu < kSteps; ++iu)
+        {
+            const double u = uMin + (uMax - uMin) * static_cast<double>(iu) / static_cast<double>(kSteps - 1);
+            for (int iv = 0; iv < kSteps; ++iv)
+            {
+                const double v = vMin + (vMax - vMin) * static_cast<double>(iv) / static_cast<double>(kSteps - 1);
+                ++out.total;
+
+                BRepLProp_SLProps props(surf, u, v, 2, Precision::Confusion());
+                if (!props.IsCurvatureDefined())
+                {
+                    ++out.large;  // treat undefined as open/accessible
+                    continue;
+                }
+
+                const double maxK = props.MaxCurvature();
+                if (!std::isfinite(maxK) || maxK <= 0.0)
+                {
+                    ++out.large;  // convex or flat — no tool-size constraint
+                    continue;
+                }
+
+                // Concave feature: convert curvature to radius in inches
+                const double radiusIn = (1.0 / maxK) * lengthToInches;
+                if      (radiusIn > 0.25)  ++out.large;
+                else if (radiusIn >= 0.125) ++out.medium;
+                else                        ++out.small;
             }
         }
     }
@@ -409,31 +466,51 @@ namespace
         CurvatureStats conCurv;
         CurvatureStats combinedCurv;
 
+        // Tool-accessibility accumulators (native area units — ratios cancel units)
+        double largeToolArea  = 0.0;  // accessible by tools > 0.5" dia
+        double mediumToolArea = 0.0;  // needs 0.25–0.5" dia tool
+        double smallToolArea  = 0.0;  // needs < 0.25" dia tool
+
         for (TopExp_Explorer exp(shape, TopAbs_FACE); exp.More(); exp.Next())
         {
             const TopoDS_Face face = TopoDS::Face(exp.Current());
 
             GProp_GProps faceProps;
             BRepGProp::SurfaceProperties(face, faceProps);
-            totalAreaNative += std::abs(faceProps.Mass());
+            const double faceArea = std::abs(faceProps.Mass());
+            totalAreaNative += faceArea;
 
             BRepAdaptor_Surface surf(face, Standard_True);
-            switch (surf.GetType())
+            const GeomAbs_SurfaceType surfType = surf.GetType();
+
+            switch (surfType)
             {
-                case GeomAbs_Plane:
-                    ++planarCount;
-                    break;
-                case GeomAbs_Cylinder:
-                    ++cylCount;
-                    appendCurvatureSamples(face, lengthToInches, cylCurv);
-                    break;
-                case GeomAbs_Cone:
-                    ++conCount;
-                    appendCurvatureSamples(face, lengthToInches, conCurv);
-                    break;
-                default:
-                    ++otherCount;
-                    break;
+                case GeomAbs_Plane:    ++planarCount; break;
+                case GeomAbs_Cylinder: ++cylCount;    appendCurvatureSamples(face, lengthToInches, cylCurv); break;
+                case GeomAbs_Cone:     ++conCount;    appendCurvatureSamples(face, lengthToInches, conCurv); break;
+                default:               ++otherCount;  break;
+            }
+
+            // Tool accessibility: planar faces are always reachable by large tools;
+            // all curved faces are sampled for concave curvature and area-distributed.
+            if (surfType == GeomAbs_Plane)
+            {
+                largeToolArea += faceArea;
+            }
+            else
+            {
+                ToolAccessSamples s;
+                sampleToolAccess(face, lengthToInches, s);
+                if (s.total > 0)
+                {
+                    largeToolArea  += faceArea * static_cast<double>(s.large)  / s.total;
+                    mediumToolArea += faceArea * static_cast<double>(s.medium) / s.total;
+                    smallToolArea  += faceArea * static_cast<double>(s.small)  / s.total;
+                }
+                else
+                {
+                    largeToolArea += faceArea;
+                }
             }
         }
 
@@ -465,6 +542,11 @@ namespace
 
         const double areaIn2 = totalAreaNative * lengthToInches * lengthToInches;
         const double volumeIn3 = volumeNative * lengthToInches * lengthToInches * lengthToInches;
+
+        const double classifiedArea = largeToolArea + mediumToolArea + smallToolArea;
+        const double pctLarge  = classifiedArea > 0.0 ? 100.0 * largeToolArea  / classifiedArea : 0.0;
+        const double pctMedium = classifiedArea > 0.0 ? 100.0 * mediumToolArea / classifiedArea : 0.0;
+        const double pctSmall  = classifiedArea > 0.0 ? 100.0 * smallToolArea  / classifiedArea : 0.0;
 
         const auto percent = [faces](int count) -> double {
             return faces > 0 ? 100.0 * static_cast<double>(count) / static_cast<double>(faces) : 0.0;
@@ -510,6 +592,13 @@ namespace
             json << "      \"dimensions_lwh\": null,\n";
             json << "      \"volume\": null\n";
         }
+        json << "    },\n";
+        json << "    \"tool_accessibility\": {\n";
+        json << "      \"method\": \"surface-area weighted by concave curvature radius sampled on 5x5 UV grid per face\",\n";
+        json << "      \"note\": \"percentages reflect share of total surface area, not removed-material volume\",\n";
+        json << "      \"large_tool_gt_0_5in_dia\": {\"percent\": " << pctLarge  << "},\n";
+        json << "      \"medium_tool_0_25_to_0_5in_dia\": {\"percent\": " << pctMedium << "},\n";
+        json << "      \"small_tool_lt_0_25in_dia\": {\"percent\": " << pctSmall  << "}\n";
         json << "    }\n";
         json << "  },\n";
         json << "  \"face_type_distribution\": {\n";
