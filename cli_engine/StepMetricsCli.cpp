@@ -245,9 +245,20 @@ namespace
     }
 
     // Samples concave curvature across a face's UV domain and buckets each sample
-    // by the minimum tool radius that can reach it.  Uses signed MaxCurvature():
-    //   > 0 → curvature center on the outward-normal side → concave feature
-    //   ≤ 0 → convex or flat → no tool-size constraint
+    // by the minimum tool radius that can reach it.
+    //
+    // Sign convention: BRepLProp_SLProps curvatures are relative to the parametric
+    // surface normal (u×v direction), which is independent of the face's topological
+    // orientation in the solid.  For a cylinder, k_axial=0 and k_circ=-1/R in the
+    // parametric frame regardless of whether it is a hole or a boss.
+    //
+    // To determine concavity from the solid's perspective we need the curvature
+    // relative to the SOLID's outward normal:
+    //   FORWARD face  → solid outward normal == parametric normal → use  MaxCurvature()
+    //   REVERSED face → solid outward normal == -parametric normal → use -MinCurvature()
+    //
+    // A cylindrical hole wall is REVERSED: effective max = -MinCurvature() = 1/R > 0 ✓
+    // An external cylindrical boss is FORWARD: effective max = MaxCurvature() = 0  ✓
     void sampleToolAccess(const TopoDS_Face& face, double lengthToInches, ToolAccessSamples& out)
     {
         BRepAdaptor_Surface surf(face, Standard_True);
@@ -257,6 +268,8 @@ namespace
             return;
         if (uMax <= uMin || vMax <= vMin)
             return;
+
+        const bool isReversed = (face.Orientation() == TopAbs_REVERSED);
 
         constexpr int kSteps = 5;
         for (int iu = 0; iu < kSteps; ++iu)
@@ -274,18 +287,24 @@ namespace
                     continue;
                 }
 
-                const double maxK = props.MaxCurvature();
-                if (!std::isfinite(maxK) || maxK <= 0.0)
+                // Effective max concave curvature from the solid's outward-normal frame.
+                // Positive value means the surface curves toward the accessible void side
+                // (a tool must fit into the concavity).
+                const double effectiveMaxK = isReversed
+                    ? -props.MinCurvature()
+                    :  props.MaxCurvature();
+
+                if (!std::isfinite(effectiveMaxK) || effectiveMaxK <= 0.0)
                 {
                     ++out.large;  // convex or flat — no tool-size constraint
                     continue;
                 }
 
-                // Concave feature: convert curvature to radius in inches
-                const double radiusIn = (1.0 / maxK) * lengthToInches;
-                if      (radiusIn > 0.25)  ++out.large;
-                else if (radiusIn >= 0.125) ++out.medium;
-                else                        ++out.small;
+                // Concave feature: radius = 1/curvature, converted to inches
+                const double radiusIn = (1.0 / effectiveMaxK) * lengthToInches;
+                if      (radiusIn > 0.25)   ++out.large;
+                else if (radiusIn >= 0.125)  ++out.medium;
+                else                         ++out.small;
             }
         }
     }
