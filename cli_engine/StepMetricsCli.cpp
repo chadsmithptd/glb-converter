@@ -14,6 +14,13 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <vector>
+
+#include <gp_Ax1.hxx>
+#include <gp_Dir.hxx>
+#include <gp_Pnt.hxx>
+#include <gp_Vec.hxx>
+#include <gp_XYZ.hxx>
 
 #ifdef _WIN32
 #  include <AIS_InteractiveContext.hxx>
@@ -88,6 +95,13 @@ namespace
         {
             return sampleCount ? sum / static_cast<double>(sampleCount) : 0.0;
         }
+    };
+
+    // Cylinder face axis + area, collected during the face loop for symmetry analysis.
+    struct CylFaceAxisInfo
+    {
+        gp_Ax1 axis;
+        double area = 0.0;
     };
 
     // Counts UV sample points by required tool size based on signed concave curvature.
@@ -490,6 +504,9 @@ namespace
         double mediumToolArea = 0.0;  // needs 0.25–0.5" dia tool
         double smallToolArea  = 0.0;  // needs < 0.25" dia tool
 
+        // Cylinder axes collected for rotational symmetry analysis
+        std::vector<CylFaceAxisInfo> cylFaceAxes;
+
         for (TopExp_Explorer exp(shape, TopAbs_FACE); exp.More(); exp.Next())
         {
             const TopoDS_Face face = TopoDS::Face(exp.Current());
@@ -505,7 +522,11 @@ namespace
             switch (surfType)
             {
                 case GeomAbs_Plane:    ++planarCount; break;
-                case GeomAbs_Cylinder: ++cylCount;    appendCurvatureSamples(face, lengthToInches, cylCurv); break;
+                case GeomAbs_Cylinder:
+                    ++cylCount;
+                    appendCurvatureSamples(face, lengthToInches, cylCurv);
+                    cylFaceAxes.push_back({surf.Cylinder().Axis(), faceArea});
+                    break;
                 case GeomAbs_Cone:     ++conCount;    appendCurvatureSamples(face, lengthToInches, conCurv); break;
                 default:               ++otherCount;  break;
             }
@@ -567,6 +588,124 @@ namespace
         const double pctMedium = classifiedArea > 0.0 ? 100.0 * mediumToolArea / classifiedArea : 0.0;
         const double pctSmall  = classifiedArea > 0.0 ? 100.0 * smallToolArea  / classifiedArea : 0.0;
 
+        // ── Rotational symmetry analysis ─────────────────────────────────────────────
+
+        // Total cylindrical area and its share of the whole surface
+        double totalCylAreaNative = 0.0;
+        for (const CylFaceAxisInfo& cfi : cylFaceAxes)
+            totalCylAreaNative += cfi.area;
+        const double cylAreaPercent = (totalAreaNative > 0.0)
+            ? 100.0 * totalCylAreaNative / totalAreaNative : 0.0;
+
+        // Group cylinder axes by direction.
+        // Anti-parallel axes (same geometric axis, opposite sense) are canonicalised
+        // so the component with the largest absolute value is always positive.
+        struct AxisGroup
+        {
+            gp_Dir dir;
+            gp_XYZ locWeightedSum = gp_XYZ(0.0, 0.0, 0.0);
+            double areaSum        = 0.0;
+            int    count          = 0;
+        };
+
+        constexpr double kAxisAngleTolRad = 0.034907; // 2 degrees
+
+        auto canonDir = [](const gp_Dir& d) -> gp_Dir
+        {
+            const double ax = std::abs(d.X()), ay = std::abs(d.Y()), az = std::abs(d.Z());
+            double sign;
+            if (ax >= ay && ax >= az) sign = (d.X() >= 0.0) ? 1.0 : -1.0;
+            else if (ay >= az)         sign = (d.Y() >= 0.0) ? 1.0 : -1.0;
+            else                       sign = (d.Z() >= 0.0) ? 1.0 : -1.0;
+            return sign >= 0.0 ? d : d.Reversed();
+        };
+
+        std::vector<AxisGroup> axisGroups;
+        for (const CylFaceAxisInfo& cfi : cylFaceAxes)
+        {
+            const gp_Dir cd = canonDir(cfi.axis.Direction());
+            bool found = false;
+            for (AxisGroup& grp : axisGroups)
+            {
+                if (grp.dir.Angle(cd) < kAxisAngleTolRad)
+                {
+                    grp.locWeightedSum.Add(cfi.axis.Location().XYZ().Multiplied(cfi.area));
+                    grp.areaSum += cfi.area;
+                    ++grp.count;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found)
+            {
+                AxisGroup g;
+                g.dir            = cd;
+                g.locWeightedSum = cfi.axis.Location().XYZ().Multiplied(cfi.area);
+                g.areaSum        = cfi.area;
+                g.count          = 1;
+                axisGroups.push_back(g);
+            }
+        }
+
+        // Find dominant group (most cylindrical area)
+        int dominantIdx = -1;
+        for (int i = 0; i < static_cast<int>(axisGroups.size()); ++i)
+            if (dominantIdx < 0 || axisGroups[i].areaSum > axisGroups[dominantIdx].areaSum)
+                dominantIdx = i;
+
+        // Output values — sensible defaults for the no-cylinder case
+        double      symConfidence    = 0.0;
+        bool        hasStrongSym     = false;
+        gp_Dir      mainAxisDir(0.0, 0.0, 1.0);
+        gp_Pnt      mainAxisPt(0.0, 0.0, 0.0);
+        std::string dominantProcess  = "Milled";
+
+        if (dominantIdx >= 0 && totalCylAreaNative > 0.0)
+        {
+            const AxisGroup& dom = axisGroups[dominantIdx];
+            mainAxisDir = dom.dir;
+
+            // Area-weighted centroid of the axes in this group
+            const gp_Pnt avgLoc(dom.locWeightedSum.Divided(dom.areaSum));
+
+            // Project center of mass onto dominant axis → clean, on-axis reference point
+            const gp_Pnt com = volProps.CentreOfMass();
+            const gp_Vec comVec(avgLoc, com);
+            const double t   = comVec.Dot(gp_Vec(mainAxisDir));
+            mainAxisPt       = avgLoc.Translated(gp_Vec(mainAxisDir).Multiplied(t));
+
+            // Bounding-sphere radius for normalising the CoM-to-axis distance
+            double bsR = 1.0;
+            if (hasBbox)
+            {
+                const double ddx = xMax-xMin, ddy = yMax-yMin, ddz = zMax-zMin;
+                bsR = std::sqrt(ddx*ddx + ddy*ddy + ddz*ddz) / 2.0;
+                if (bsR < 1e-10) bsR = 1.0;
+            }
+
+            // Distance from CoM to dominant axis line
+            const gp_Vec perp     = comVec - gp_Vec(mainAxisDir).Multiplied(t);
+            const double distCoM  = perp.Magnitude();
+            const double normDist = distCoM / bsR;
+
+            // axisCoverage: what fraction of all cyl area sits on the dominant axis
+            const double axisCoverage = dom.areaSum / totalCylAreaNative;
+
+            // proximityFactor: penalise axes that don't pass near the CoM
+            // (a turned part's axis runs through or very near its CoM)
+            const double proximityFactor = 1.0 / (1.0 + normDist * 4.0);
+
+            symConfidence = std::min(1.0, axisCoverage * (0.55 + 0.45 * proximityFactor));
+
+            hasStrongSym = (cylAreaPercent     >= 30.0)
+                        && (axisCoverage       >= 0.65)
+                        && (symConfidence      >= 0.45);
+
+            if      (cylAreaPercent >= 55.0 && symConfidence >= 0.65) dominantProcess = "Turned";
+            else if (cylAreaPercent <  15.0)                           dominantProcess = "Milled";
+            else                                                        dominantProcess = "Hybrid";
+        }
+
         const auto percent = [faces](int count) -> double {
             return faces > 0 ? 100.0 * static_cast<double>(count) / static_cast<double>(faces) : 0.0;
         };
@@ -618,6 +757,18 @@ namespace
         json << "      \"large_tool_gt_0_5in_dia\": {\"percent\": " << pctLarge  << "},\n";
         json << "      \"medium_tool_0_25_to_0_5in_dia\": {\"percent\": " << pctMedium << "},\n";
         json << "      \"small_tool_lt_0_25in_dia\": {\"percent\": " << pctSmall  << "}\n";
+        json << "    },\n";
+        json << "    \"rotational_symmetry\": {\n";
+        json << "      \"cylindrical_area_percent\": " << cylAreaPercent << ",\n";
+        json << "      \"has_strong_rotational_symmetry\": " << (hasStrongSym ? "true" : "false") << ",\n";
+        json << "      \"symmetry_confidence\": " << symConfidence << ",\n";
+        json << "      \"main_axis_direction\": ["
+             << mainAxisDir.X() << ", " << mainAxisDir.Y() << ", " << mainAxisDir.Z() << "],\n";
+        json << "      \"main_axis_point\": ["
+             << mainAxisPt.X() * lengthToInches << ", "
+             << mainAxisPt.Y() * lengthToInches << ", "
+             << mainAxisPt.Z() * lengthToInches << "],\n";
+        json << "      \"dominant_process\": \"" << dominantProcess << "\"\n";
         json << "    }\n";
         json << "  },\n";
         json << "  \"face_type_distribution\": {\n";
