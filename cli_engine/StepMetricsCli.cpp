@@ -17,6 +17,7 @@
 #include <vector>
 
 #include <gp_Ax1.hxx>
+#include <gp_Cylinder.hxx>
 #include <gp_Dir.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Vec.hxx>
