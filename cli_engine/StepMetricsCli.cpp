@@ -475,14 +475,16 @@ namespace
 
         std::string sourceStepUnit = primaryStepLengthUnit(reader);
         if (sourceStepUnit.empty())
-        {
-            if (const char* unitRaw = Interface_Static::CVal("xstep.cascade.unit"))
-                sourceStepUnit = unitRaw;
-        }
-        if (sourceStepUnit.empty())
             sourceStepUnit = "mm";
 
-        double lengthToInches = unitToInches(sourceStepUnit);
+        // Shape coordinates are stored in OCCT's cascade unit (default "mm"), not
+        // necessarily the file's declared unit. Use the cascade unit for all metric
+        // conversions; keep sourceStepUnit only for the JSON display field.
+        std::string cascadeUnit = "mm";
+        if (const char* cu = Interface_Static::CVal("xstep.cascade.unit"))
+            cascadeUnit = cu;
+
+        double lengthToInches = unitToInches(cascadeUnit);
         if (lengthToInches <= 0.0)
             lengthToInches = 1.0 / 25.4;
 
