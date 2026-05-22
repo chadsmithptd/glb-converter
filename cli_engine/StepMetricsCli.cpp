@@ -398,8 +398,11 @@ namespace
             return;
 
         const double linearDeflection = computeLinearDeflection(shape);
-        constexpr double angularDeflection = 0.35;
-        BRepMesh_IncrementalMesh mesher(shape, linearDeflection, Standard_False, angularDeflection, Standard_True);
+        // 0.1 rad (~5.7°) gives ≈63 segments per full circle → <0.1% diameter error.
+        // Relative mode applies linearDeflection per-face so small holes on large parts
+        // aren't under-sampled by the body-diagonal heuristic.
+        constexpr double angularDeflection = 0.1;
+        BRepMesh_IncrementalMesh mesher(shape, linearDeflection, Standard_True, angularDeflection, Standard_True);
         mesher.Perform();
     }
 
