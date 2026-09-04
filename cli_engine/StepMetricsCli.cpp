@@ -44,10 +44,16 @@
 #include <BRepGProp.hxx>
 #include <BRepLProp_SLProps.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
+#include <BRep_Tool.hxx>
 #include <BRepTools.hxx>
 #include <Bnd_Box.hxx>
 #include <GProp_GProps.hxx>
+#include <Geom_CylindricalSurface.hxx>
+#include <Geom_OffsetSurface.hxx>
+#include <Geom_RectangularTrimmedSurface.hxx>
+#include <Geom_Surface.hxx>
 #include <GeomAbs_SurfaceType.hxx>
+#include <TopLoc_Location.hxx>
 #include <IFSelect_ReturnStatus.hxx>
 #include <Interface_Static.hxx>
 #include <Message_ProgressRange.hxx>
@@ -104,6 +110,45 @@ namespace
         gp_Ax1 axis;
         double area = 0.0;
     };
+
+    // Ubuntu OCCT headers only forward-declare gp_Cylinder, so adaptor.Cylinder()
+    // cannot be used there. Pull the axis from the underlying Geom surface instead.
+    bool cylindricalFaceAxis(const TopoDS_Face& face, gp_Ax1& axis)
+    {
+        TopLoc_Location loc;
+        Handle(Geom_Surface) surface = BRep_Tool::Surface(face, loc);
+        while (!surface.IsNull())
+        {
+            Handle(Geom_CylindricalSurface) cylinder =
+                Handle(Geom_CylindricalSurface)::DownCast(surface);
+            if (!cylinder.IsNull())
+            {
+                axis = cylinder->Axis();
+                if (!loc.IsIdentity())
+                    axis.Transform(loc.Transformation());
+                return true;
+            }
+
+            Handle(Geom_RectangularTrimmedSurface) trimmed =
+                Handle(Geom_RectangularTrimmedSurface)::DownCast(surface);
+            if (!trimmed.IsNull())
+            {
+                surface = trimmed->BasisSurface();
+                continue;
+            }
+
+            Handle(Geom_OffsetSurface) offset =
+                Handle(Geom_OffsetSurface)::DownCast(surface);
+            if (!offset.IsNull())
+            {
+                surface = offset->BasisSurface();
+                continue;
+            }
+
+            return false;
+        }
+        return false;
+    }
 
     // Counts UV sample points by required tool size based on signed concave curvature.
     // MaxCurvature() > 0 means the curvature center is on the outward-normal side →
@@ -529,10 +574,19 @@ namespace
             {
                 case GeomAbs_Plane:    ++planarCount; break;
                 case GeomAbs_Cylinder:
+                {
                     ++cylCount;
                     appendCurvatureSamples(face, lengthToInches, cylCurv);
-                    cylFaceAxes.push_back({surf.Cylinder().Axis(), faceArea});
+                    gp_Ax1 axis;
+                    if (cylindricalFaceAxis(face, axis))
+                    {
+                        CylFaceAxisInfo info;
+                        info.axis = axis;
+                        info.area = faceArea;
+                        cylFaceAxes.push_back(info);
+                    }
                     break;
+                }
                 case GeomAbs_Cone:     ++conCount;    appendCurvatureSamples(face, lengthToInches, conCurv); break;
                 default:               ++otherCount;  break;
             }
