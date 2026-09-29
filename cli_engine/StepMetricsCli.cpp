@@ -573,6 +573,7 @@ namespace
         bool   ok       = false;
         bool   complete = true;   // false when the time budget cut sampling short
         int    samples  = 0;
+        double sampledAreaNative = 0.0;       // area of the faces actually sampled
         double minThicknessNative = -1.0;     // -1: no wall thinner than the largest band
         std::vector<double> bandLimitsIn;     // inches
         std::vector<double> bandAreaNative;   // surface area whose local thickness < limit
@@ -604,10 +605,12 @@ namespace
             return r;
 
         const double maxRayNative = (r.bandLimitsIn.back() / lengthToInches) * 1.01;
-        const double startEps     = std::max(diag * 1e-6, 1e-4 / lengthToInches); // skip self-hits
+        // Rays from free-form (B-spline) faces can re-hit their own face within tolerance;
+        // nothing under 0.002 in is a real machinable wall, so hits closer than that are skipped.
+        const double startEps     = std::max(diag * 1e-5, 0.002 / lengthToInches);
         constexpr double kSampleBudget = 8000.0;
         constexpr int    kMaxGridSide  = 20;
-        constexpr double kTimeBudgetSec = 20.0;
+        constexpr double kTimeBudgetSec = 40.0;  // Xano waits up to 120 s for the whole request
         const auto started = std::chrono::steady_clock::now();
 
         IntCurvesFace_ShapeIntersector inter;
@@ -676,6 +679,7 @@ namespace
             if (thickness.empty())
                 continue;
             const double weight = area / static_cast<double>(thickness.size());
+            r.sampledAreaNative += area;
             for (double t : thickness)
             {
                 ++r.samples;
@@ -688,6 +692,14 @@ namespace
                     if (tIn < r.bandLimitsIn[b])
                         r.bandAreaNative[b] += weight;
             }
+        }
+
+        // Time budget hit: scale the sampled faces up to the whole part (reported via coverage).
+        if (!r.complete && r.sampledAreaNative > 0.0)
+        {
+            const double scale = totalAreaNative / r.sampledAreaNative;
+            for (double& a : r.bandAreaNative)
+                a *= scale;
         }
 
         r.ok = true;
@@ -1355,6 +1367,7 @@ namespace
             }
             json << "], \"samples\": " << thinWalls.samples
                  << ", \"complete\": " << (thinWalls.complete ? "true" : "false")
+                 << ", \"coverage\": " << (totalAreaNative > 0.0 ? thinWalls.sampledAreaNative / totalAreaNative : 0.0)
                  << ", \"unit\": \"in^2\"}\n";
         }
         else
