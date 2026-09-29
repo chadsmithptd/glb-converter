@@ -42,3 +42,19 @@ npm start
 
 Open `http://localhost:3000`.
 
+## Feature output (hole detection + face classes)
+
+`StepMetricsCli` (analyze mode, and `POST /api/analyze-step`) also reports:
+
+- `geometry.face_classes` -- surface area in in^2 split into `planar`, `contour`
+  (cylinder/cone/sphere/torus/revolution/extrusion) and `generic` (B-spline/other) faces.
+- `geometry.hole_summary` -- hole count and through-hole count. Small, so it is safe in the
+  `X-Part-Metrics` header returned by `POST /api/convert-step-to-glb`.
+- `features.holes` -- one entry per detected hole, from the exact B-rep geometry: concave
+  cylindrical faces grouped by radius, coaxial axis and overlapping extent (split halves merged;
+  a hole needs >= 300 deg of combined arc). Each hole has a stable geometric `key`, `diameter`,
+  `depth` (cylindrical wall, drill point excluded), `through` (true/false/null), `center`,
+  `axis`, `end_points`, `stack_id`/`stack_size` (coaxial stacks such as counterbores) and a
+  `suggested_type`. All lengths in inches. This list is top-level on purpose so it never goes
+  into the HTTP header; read it from `/api/analyze-step`.
+

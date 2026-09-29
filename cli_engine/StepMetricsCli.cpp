@@ -40,6 +40,7 @@
 #endif
 
 #include <BRepAdaptor_Surface.hxx>
+#include <BRepClass3d_SolidClassifier.hxx>
 #include <BRepBndLib.hxx>
 #include <BRepGProp.hxx>
 #include <BRepLProp_SLProps.hxx>
@@ -74,6 +75,7 @@
 #include <TopoDS.hxx>
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
+#include <TopAbs_State.hxx>
 #include <XCAFApp_Application.hxx>
 #include <XCAFDoc_DocumentTool.hxx>
 #include <XCAFDoc_ShapeTool.hxx>
@@ -148,6 +150,295 @@ namespace
             return false;
         }
         return false;
+    }
+
+    // Radius of a cylindrical face's underlying surface (same unwrapping as
+    // cylindricalFaceAxis). Offset surfaces are skipped: their radius differs from the basis.
+    bool cylindricalFaceRadius(const TopoDS_Face& face, double& radius)
+    {
+        TopLoc_Location loc;
+        Handle(Geom_Surface) surface = BRep_Tool::Surface(face, loc);
+        while (!surface.IsNull())
+        {
+            Handle(Geom_CylindricalSurface) cylinder =
+                Handle(Geom_CylindricalSurface)::DownCast(surface);
+            if (!cylinder.IsNull())
+            {
+                radius = cylinder->Radius();
+                return true;
+            }
+
+            Handle(Geom_RectangularTrimmedSurface) trimmed =
+                Handle(Geom_RectangularTrimmedSurface)::DownCast(surface);
+            if (!trimmed.IsNull())
+            {
+                surface = trimmed->BasisSurface();
+                continue;
+            }
+
+            return false;
+        }
+        return false;
+    }
+
+    // One cylindrical face, reduced to what hole detection needs. Axial positions are
+    // measured along the face's own axis line from its location point.
+    struct CylPiece
+    {
+        gp_Pnt axisLoc;
+        gp_Dir axisDir;      // canonicalised (largest component positive)
+        double radius  = 0.0;
+        double t0      = 0.0; // axial start along axisDir from axisLoc
+        double t1      = 0.0; // axial end
+        double arcRad  = 0.0; // angular span of the face
+        bool   concave = false;
+    };
+
+    gp_Dir canonicalDir(const gp_Dir& d)
+    {
+        const double ax = std::abs(d.X()), ay = std::abs(d.Y()), az = std::abs(d.Z());
+        double sign;
+        if (ax >= ay && ax >= az) sign = (d.X() >= 0.0) ? 1.0 : -1.0;
+        else if (ay >= az)         sign = (d.Y() >= 0.0) ? 1.0 : -1.0;
+        else                       sign = (d.Z() >= 0.0) ? 1.0 : -1.0;
+        return sign >= 0.0 ? d : d.Reversed();
+    }
+
+    // Distance between two (parallel) axis lines, both given by point + direction.
+    double axisLineDistance(const gp_Pnt& p1, const gp_Dir& d1, const gp_Pnt& p2)
+    {
+        const gp_Vec v(p1, p2);
+        return v.Crossed(gp_Vec(d1)).Magnitude();
+    }
+
+    // Builds a CylPiece from a cylindrical face. Concavity comes from comparing the
+    // face's material-side normal (parametric normal, flipped for REVERSED faces) with the
+    // radial direction away from the axis: pointing toward the axis = a hole wall.
+    bool makeCylPiece(const TopoDS_Face& face, CylPiece& out)
+    {
+        gp_Ax1 axis;
+        double radius = 0.0;
+        if (!cylindricalFaceAxis(face, axis) || !cylindricalFaceRadius(face, radius))
+            return false;
+        if (!(radius > 0.0))
+            return false;
+
+        Standard_Real uMin = 0.0, uMax = 0.0, vMin = 0.0, vMax = 0.0;
+        BRepTools::UVBounds(face, uMin, uMax, vMin, vMax);
+        if (!(std::isfinite(uMin) && std::isfinite(uMax) && std::isfinite(vMin) && std::isfinite(vMax)))
+            return false;
+        if (uMax <= uMin || vMax <= vMin)
+            return false;
+
+        BRepAdaptor_Surface surf(face, Standard_True);
+        const double uMid = 0.5 * (uMin + uMax);
+        const double vMid = 0.5 * (vMin + vMax);
+
+        const gp_Dir dir = canonicalDir(axis.Direction());
+        const gp_Pnt loc = axis.Location();
+
+        const gp_Pnt pA = surf.Value(uMid, vMin);
+        const gp_Pnt pB = surf.Value(uMid, vMax);
+        const double tA = gp_Vec(loc, pA).Dot(gp_Vec(dir));
+        const double tB = gp_Vec(loc, pB).Dot(gp_Vec(dir));
+
+        BRepLProp_SLProps props(surf, uMid, vMid, 1, Precision::Confusion());
+        if (!props.IsNormalDefined())
+            return false;
+        gp_Dir normal = props.Normal();
+        if (face.Orientation() == TopAbs_REVERSED)
+            normal.Reverse();
+
+        const gp_Pnt pMid = surf.Value(uMid, vMid);
+        const double tMid = gp_Vec(loc, pMid).Dot(gp_Vec(dir));
+        const gp_Pnt foot = loc.Translated(gp_Vec(dir).Multiplied(tMid));
+        const gp_Vec radial(foot, pMid);
+        if (radial.Magnitude() < Precision::Confusion())
+            return false;
+
+        out.axisLoc = loc;
+        out.axisDir = dir;
+        out.radius  = radius;
+        out.t0      = std::min(tA, tB);
+        out.t1      = std::max(tA, tB);
+        out.arcRad  = std::min(uMax - uMin, 2.0 * M_PI);
+        out.concave = gp_Vec(normal).Dot(radial) < 0.0;
+        return true;
+    }
+
+    struct DetectedHole
+    {
+        gp_Pnt axisLoc;      // reference point of the hole's axis line
+        gp_Dir axisDir;
+        double radius   = 0.0;
+        double t0       = 0.0;
+        double t1       = 0.0;
+        double arcRad   = 0.0;
+        int    faces    = 0;
+        int    through  = -1; // 1 through, 0 blind, -1 unknown
+        int    stackId  = 0;
+        bool   largestInStack = false;
+        int    stackSize = 1;
+    };
+
+    // Air (OUT) at a point? Used to tell through holes from blind ones. One classifier is
+    // built per part and reused -- constructing it per query is expensive on hole-heavy parts.
+    int classifyOut(BRepClass3d_SolidClassifier& classifier, const gp_Pnt& p, double tol)
+    {
+        try
+        {
+            classifier.Perform(p, tol);
+            const TopAbs_State st = classifier.State();
+            if (st == TopAbs_OUT) return 1;
+            if (st == TopAbs_IN)  return 0;
+            return -1;
+        }
+        catch (...)
+        {
+            return -1;
+        }
+    }
+
+    // Groups concave cylindrical pieces into holes: same radius, parallel and coaxial axes,
+    // overlapping axial extent. B-rep kernels often split one hole into two 180 deg faces
+    // (or more, around cross-holes), so a group becomes a hole when its pieces together
+    // cover at least 300 deg of arc -- the same rule the WeWeb step-viewer applies to meshes,
+    // here on exact geometry. Depth = axial extent of the cylindrical wall (drill point
+    // excluded). Through = the space just past both ends lies outside the solid.
+    std::vector<DetectedHole> detectHoles(const TopoDS_Shape& shape, const std::vector<CylPiece>& pieces)
+    {
+        std::vector<DetectedHole> holes;
+        std::vector<bool> used(pieces.size(), false);
+        BRepClass3d_SolidClassifier classifier(shape);
+        constexpr double kParallelTolRad = 0.00873; // 0.5 deg
+        constexpr double kMinHoleArcRad  = 5.23599; // 300 deg
+
+        for (std::size_t i = 0; i < pieces.size(); ++i)
+        {
+            if (used[i] || !pieces[i].concave)
+                continue;
+            const CylPiece& base = pieces[i];
+            const double rTol = std::max(1e-4, base.radius * 0.005);
+            const double axTol = std::max(1e-3, base.radius * 0.01);
+
+            // Members measured in the base piece's axial frame.
+            DetectedHole h;
+            h.axisLoc = base.axisLoc;
+            h.axisDir = base.axisDir;
+            h.radius  = base.radius;
+            h.t0      = base.t0;
+            h.t1      = base.t1;
+            h.arcRad  = 0.0;
+            h.faces   = 0;
+
+            std::vector<std::size_t> members;
+            for (std::size_t j = i; j < pieces.size(); ++j)
+            {
+                if (used[j] || !pieces[j].concave)
+                    continue;
+                const CylPiece& c = pieces[j];
+                if (std::abs(c.radius - base.radius) > rTol)
+                    continue;
+                if (base.axisDir.Angle(c.axisDir) > kParallelTolRad)
+                    continue;
+                if (axisLineDistance(base.axisLoc, base.axisDir, c.axisLoc) > axTol)
+                    continue;
+                members.push_back(j);
+            }
+
+            // Re-express member extents in the base frame and merge overlapping bands.
+            struct Band { double t0; double t1; double arc; int faces; std::vector<std::size_t> idx; };
+            std::vector<Band> bands;
+            for (std::size_t j : members)
+            {
+                const CylPiece& c = pieces[j];
+                const double shift = gp_Vec(base.axisLoc, c.axisLoc).Dot(gp_Vec(base.axisDir));
+                const double c0 = c.t0 + shift;
+                const double c1 = c.t1 + shift;
+                bool merged = false;
+                for (Band& b : bands)
+                {
+                    if (c0 <= b.t1 + axTol && c1 >= b.t0 - axTol)
+                    {
+                        b.t0 = std::min(b.t0, c0);
+                        b.t1 = std::max(b.t1, c1);
+                        b.arc += c.arcRad;
+                        ++b.faces;
+                        b.idx.push_back(j);
+                        merged = true;
+                        break;
+                    }
+                }
+                if (!merged)
+                    bands.push_back(Band{c0, c1, c.arcRad, 1, std::vector<std::size_t>{j}});
+            }
+
+            for (const Band& b : bands)
+            {
+                if (b.arc < kMinHoleArcRad)
+                    continue;
+                DetectedHole hole = h;
+                hole.t0 = b.t0;
+                hole.t1 = b.t1;
+                hole.arcRad = std::min(b.arc, 2.0 * M_PI);
+                hole.faces = b.faces;
+                for (std::size_t j : b.idx)
+                    used[j] = true;
+
+                const double eps = std::max(0.05, hole.radius * 0.05);
+                const gp_Pnt before = hole.axisLoc.Translated(gp_Vec(hole.axisDir).Multiplied(hole.t0 - eps));
+                const gp_Pnt after  = hole.axisLoc.Translated(gp_Vec(hole.axisDir).Multiplied(hole.t1 + eps));
+                const int outBefore = classifyOut(classifier, before, 1e-4);
+                const int outAfter  = classifyOut(classifier, after, 1e-4);
+                if (outBefore == 1 && outAfter == 1)      hole.through = 1;
+                else if (outBefore == 0 || outAfter == 0) hole.through = 0;
+                else                                      hole.through = -1;
+
+                holes.push_back(hole);
+            }
+        }
+
+        // Coaxial stacks (counterbores, stepped holes): same axis line, touching extents.
+        int nextStack = 0;
+        for (std::size_t i = 0; i < holes.size(); ++i)
+        {
+            if (holes[i].stackId != 0)
+                continue;
+            holes[i].stackId = ++nextStack;
+            for (std::size_t j = i + 1; j < holes.size(); ++j)
+            {
+                if (holes[j].stackId != 0)
+                    continue;
+                if (holes[i].axisDir.Angle(holes[j].axisDir) > kParallelTolRad)
+                    continue;
+                const double tol = std::max(1e-3, std::min(holes[i].radius, holes[j].radius) * 0.01);
+                if (axisLineDistance(holes[i].axisLoc, holes[i].axisDir, holes[j].axisLoc) > tol)
+                    continue;
+                const double shift = gp_Vec(holes[i].axisLoc, holes[j].axisLoc).Dot(gp_Vec(holes[i].axisDir));
+                const double j0 = holes[j].t0 + shift;
+                const double j1 = holes[j].t1 + shift;
+                const double gapTol = std::max(0.05, holes[i].radius * 0.1);
+                if (j0 <= holes[i].t1 + gapTol && j1 >= holes[i].t0 - gapTol)
+                    holes[j].stackId = holes[i].stackId;
+            }
+        }
+        for (DetectedHole& a : holes)
+        {
+            int size = 0;
+            bool largest = true;
+            for (const DetectedHole& b : holes)
+            {
+                if (b.stackId != a.stackId)
+                    continue;
+                ++size;
+                if (b.radius > a.radius + 1e-6)
+                    largest = false;
+            }
+            a.stackSize = size;
+            a.largestInStack = largest && size > 1;
+        }
+
+        return holes;
     }
 
     // Counts UV sample points by required tool size based on signed concave curvature.
@@ -558,6 +849,16 @@ namespace
         // Cylinder axes collected for rotational symmetry analysis
         std::vector<CylFaceAxisInfo> cylFaceAxes;
 
+        // Face-class areas for finishing estimates (native units): planar faces, analytic
+        // curved faces (cylinder/cone/sphere/torus/revolution/extrusion = "contour"), and
+        // free-form faces (B-spline/Bezier/offset/other = "generic").
+        double planarAreaNative  = 0.0;
+        double contourAreaNative = 0.0;
+        double genericAreaNative = 0.0;
+
+        // Cylindrical faces reduced for hole detection
+        std::vector<CylPiece> cylPieces;
+
         for (TopExp_Explorer exp(shape, TopAbs_FACE); exp.More(); exp.Next())
         {
             const TopoDS_Face face = TopoDS::Face(exp.Current());
@@ -569,6 +870,35 @@ namespace
 
             BRepAdaptor_Surface surf(face, Standard_True);
             const GeomAbs_SurfaceType surfType = surf.GetType();
+
+            switch (surfType)
+            {
+                case GeomAbs_Plane:
+                    planarAreaNative += faceArea;
+                    break;
+                case GeomAbs_Cylinder:
+                case GeomAbs_Cone:
+                case GeomAbs_Sphere:
+                case GeomAbs_Torus:
+                case GeomAbs_SurfaceOfRevolution:
+                case GeomAbs_SurfaceOfExtrusion:
+                    contourAreaNative += faceArea;
+                    break;
+                default:
+                    genericAreaNative += faceArea;
+                    break;
+            }
+
+            if (surfType == GeomAbs_Cylinder)
+            {
+                try
+                {
+                    CylPiece piece;
+                    if (makeCylPiece(face, piece))
+                        cylPieces.push_back(piece);
+                }
+                catch (...) { /* a bad face never blocks the metrics */ }
+            }
 
             switch (surfType)
             {
@@ -612,6 +942,16 @@ namespace
                     largeToolArea += faceArea;
                 }
             }
+        }
+
+        std::vector<DetectedHole> holes;
+        try
+        {
+            holes = detectHoles(shape, cylPieces);
+        }
+        catch (...)
+        {
+            holes.clear();
         }
 
         if (cylCurv.sampleCount)
@@ -829,7 +1169,18 @@ namespace
              << mainAxisPt.Y() * lengthToInches << ", "
              << mainAxisPt.Z() * lengthToInches << "],\n";
         json << "      \"dominant_process\": \"" << dominantProcess << "\"\n";
-        json << "    }\n";
+        json << "    },\n";
+        const double in2 = lengthToInches * lengthToInches;
+        json << "    \"face_classes\": {\"planar\": " << planarAreaNative * in2
+             << ", \"contour\": " << contourAreaNative * in2
+             << ", \"generic\": " << genericAreaNative * in2
+             << ", \"unit\": \"in^2\"},\n";
+        int throughCount = 0;
+        for (const DetectedHole& h : holes)
+            if (h.through == 1) ++throughCount;
+        json << "    \"hole_summary\": {\"count\": " << holes.size()
+             << ", \"through\": " << throughCount
+             << ", \"detail\": \"see features.holes (analyze-step)\"}\n";
         json << "  },\n";
         json << "  \"face_type_distribution\": {\n";
         json << "    \"planar\": {\"count\": " << planarCount << ", \"percent\": " << percent(planarCount) << "},\n";
@@ -879,6 +1230,57 @@ namespace
                  << "\"max\": {\"value\": " << combinedCurv.maxValue << ", \"unit\": \"1/in\"}}";
         }
         json << "\n";
+        json << "  },\n";
+
+        // Full hole list. Top-level (outside "geometry") on purpose: the GLB endpoint copies
+        // "geometry" into an HTTP header, and a long hole list must never go there.
+        json << "  \"features\": {\n";
+        json << "    \"method\": \"B-rep: concave cylindrical faces grouped by radius + coaxial axis + overlapping extent; hole when combined arc >= 300 deg; through = air beyond both ends\",\n";
+        json << "    \"unit\": \"in\",\n";
+        json << "    \"holes\": [";
+        for (std::size_t i = 0; i < holes.size(); ++i)
+        {
+            const DetectedHole& h = holes[i];
+            const double tMid = 0.5 * (h.t0 + h.t1);
+            const gp_Pnt c  = h.axisLoc.Translated(gp_Vec(h.axisDir).Multiplied(tMid));
+            const gp_Pnt e0 = h.axisLoc.Translated(gp_Vec(h.axisDir).Multiplied(h.t0));
+            const gp_Pnt e1 = h.axisLoc.Translated(gp_Vec(h.axisDir).Multiplied(h.t1));
+            const double dia   = 2.0 * h.radius * lengthToInches;
+            const double depth = (h.t1 - h.t0) * lengthToInches;
+            const double cx = c.X() * lengthToInches, cy = c.Y() * lengthToInches, cz = c.Z() * lengthToInches;
+
+            // Stable geometric key: rounded diameter, center and axis. Same STEP -> same keys,
+            // so the backend can match re-detections to existing rows and keep user tags.
+            // Rounded to fixed decimals with -0 folded to 0, so float noise around zero
+            // cannot flip a key between runs.
+            const auto stable = [](double v, double scale) -> double {
+                double r = std::round(v * scale) / scale;
+                return (r == 0.0) ? 0.0 : r;
+            };
+            std::ostringstream key;
+            key << std::fixed << std::setprecision(3) << "d" << stable(dia, 1000.0)
+                << std::setprecision(2) << "_c" << stable(cx, 100.0) << "," << stable(cy, 100.0) << "," << stable(cz, 100.0)
+                << "_a" << stable(h.axisDir.X(), 100.0) << "," << stable(h.axisDir.Y(), 100.0) << "," << stable(h.axisDir.Z(), 100.0);
+
+            const char* suggested = (h.stackSize > 1 && h.largestInStack) ? "counterbore" : "simple";
+            const char* through = h.through == 1 ? "true" : (h.through == 0 ? "false" : "null");
+
+            json << (i ? ",\n" : "\n");
+            json << "      {\"key\": \"" << escapeJson(key.str()) << "\", "
+                 << "\"diameter\": " << dia << ", "
+                 << "\"depth\": " << depth << ", "
+                 << "\"through\": " << through << ", "
+                 << "\"center\": [" << cx << ", " << cy << ", " << cz << "], "
+                 << "\"axis\": [" << h.axisDir.X() << ", " << h.axisDir.Y() << ", " << h.axisDir.Z() << "], "
+                 << "\"end_points\": [[" << e0.X() * lengthToInches << ", " << e0.Y() * lengthToInches << ", " << e0.Z() * lengthToInches << "], ["
+                 << e1.X() * lengthToInches << ", " << e1.Y() * lengthToInches << ", " << e1.Z() * lengthToInches << "]], "
+                 << "\"arc_degrees\": " << h.arcRad * 180.0 / M_PI << ", "
+                 << "\"face_count\": " << h.faces << ", "
+                 << "\"stack_id\": " << h.stackId << ", "
+                 << "\"stack_size\": " << h.stackSize << ", "
+                 << "\"suggested_type\": \"" << suggested << "\"}";
+        }
+        json << (holes.empty() ? "]\n" : "\n    ]\n");
         json << "  }\n";
         json << "}\n";
 
