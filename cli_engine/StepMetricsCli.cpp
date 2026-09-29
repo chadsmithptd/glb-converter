@@ -422,20 +422,26 @@ namespace
                     holes[j].stackId = holes[i].stackId;
             }
         }
+        // Counterbore candidate = the largest bore in a stack that also contains a strictly
+        // smaller hole. Equal-diameter coaxial pieces (one bore interrupted by a groove) are not.
         for (DetectedHole& a : holes)
         {
             int size = 0;
             bool largest = true;
+            bool hasSmaller = false;
+            const double radiusTol = std::max(1e-4, a.radius * 0.005);
             for (const DetectedHole& b : holes)
             {
                 if (b.stackId != a.stackId)
                     continue;
                 ++size;
-                if (b.radius > a.radius + 1e-6)
+                if (b.radius > a.radius + radiusTol)
                     largest = false;
+                if (b.radius < a.radius - radiusTol)
+                    hasSmaller = true;
             }
             a.stackSize = size;
-            a.largestInStack = largest && size > 1;
+            a.largestInStack = largest && hasSmaller;
         }
 
         return holes;
