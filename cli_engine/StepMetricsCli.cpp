@@ -608,6 +608,7 @@ namespace
         // Rays from free-form (B-spline) faces can re-hit their own face within tolerance;
         // nothing under 0.002 in is a real machinable wall, so hits closer than that are skipped.
         const double startEps     = std::max(diag * 1e-5, 0.002 / lengthToInches);
+        const double sameFaceMinNative = 0.05 / lengthToInches;
         constexpr double kSampleBudget = 8000.0;
         constexpr int    kMaxGridSide  = 20;
         constexpr double kTimeBudgetSec = 40.0;  // Xano waits up to 120 s for the whole request
@@ -661,12 +662,24 @@ namespace
                     if (face.Orientation() == TopAbs_REVERSED)
                         outward.Reverse();
 
+                    // Nearest exit, ignoring re-hits of the starting face close to the start:
+                    // a real wall has two different faces, and the same face only comes back
+                    // legitimately across a feature (e.g. a pin's far side), which is far away.
                     double t = -1.0; // -1: no exit within the largest band
                     try
                     {
-                        inter.PerformNearest(gp_Lin(props.Value(), outward.Reversed()), startEps, maxRayNative);
-                        if (inter.IsDone() && inter.NbPnt() > 0)
-                            t = inter.WParameter(1);
+                        inter.Perform(gp_Lin(props.Value(), outward.Reversed()), startEps, maxRayNative);
+                        if (inter.IsDone())
+                        {
+                            for (int k = 1; k <= inter.NbPnt(); ++k)
+                            {
+                                const double w = inter.WParameter(k);
+                                if (w < sameFaceMinNative && inter.Face(k).IsSame(face))
+                                    continue;
+                                if (t < 0.0 || w < t)
+                                    t = w;
+                            }
+                        }
                     }
                     catch (...)
                     {
