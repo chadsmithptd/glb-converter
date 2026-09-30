@@ -5,6 +5,7 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cmath>
 #include <exception>
@@ -47,6 +48,10 @@
 #include <BRepMesh_IncrementalMesh.hxx>
 #include <BRep_Tool.hxx>
 #include <BRepTools.hxx>
+#include <BRepTopAdaptor_FClass2d.hxx>
+#include <IntCurvesFace_ShapeIntersector.hxx>
+#include <gp_Lin.hxx>
+#include <gp_Pnt2d.hxx>
 #include <Bnd_Box.hxx>
 #include <GProp_GProps.hxx>
 #include <Geom_CylindricalSurface.hxx>
@@ -563,6 +568,157 @@ namespace
         return -1.0;
     }
 
+    struct ThinWallResult
+    {
+        bool   ok       = false;
+        bool   complete = true;   // false when the time budget cut sampling short
+        int    samples  = 0;
+        double sampledAreaNative = 0.0;       // area of the faces actually sampled
+        double minThicknessNative = -1.0;     // -1: no wall thinner than the largest band
+        std::vector<double> bandLimitsIn;     // inches
+        std::vector<double> bandAreaNative;   // surface area whose local thickness < limit
+    };
+
+    // Local wall thickness by ray casting. Points are sampled on every face (UV grid cell
+    // centers inside the face boundary); from each, a ray goes into the material (opposite
+    // the outward normal) and the distance to the face it exits through is the local
+    // thickness there. Each sample carries its face's area / sample count, and areas thinner
+    // than each band limit are summed. Both sides of a thin wall count, since both get
+    // machined. Rays are only traced as far as the largest band, and the whole pass is
+    // time-boxed so very large parts can't stall the request.
+    ThinWallResult measureThinWalls(const TopoDS_Shape& shape, double lengthToInches, double totalAreaNative)
+    {
+        ThinWallResult r;
+        r.bandLimitsIn   = {0.02, 0.04, 0.06, 0.08, 0.10, 0.125, 0.1875, 0.25};
+        r.bandAreaNative.assign(r.bandLimitsIn.size(), 0.0);
+        if (totalAreaNative <= 0.0 || lengthToInches <= 0.0)
+            return r;
+
+        Bnd_Box box;
+        BRepBndLib::Add(shape, box);
+        if (box.IsVoid())
+            return r;
+        double x0, y0, z0, x1, y1, z1;
+        box.Get(x0, y0, z0, x1, y1, z1);
+        const double diag = std::sqrt((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0) + (z1 - z0) * (z1 - z0));
+        if (diag <= 0.0)
+            return r;
+
+        const double maxRayNative = (r.bandLimitsIn.back() / lengthToInches) * 1.01;
+        // Rays from free-form (B-spline) faces can re-hit their own face within tolerance;
+        // nothing under 0.002 in is a real machinable wall, so hits closer than that are skipped.
+        const double startEps     = std::max(diag * 1e-5, 0.002 / lengthToInches);
+        const double sameFaceMinNative = 0.05 / lengthToInches;
+        constexpr double kSampleBudget = 8000.0;
+        constexpr int    kMaxGridSide  = 20;
+        constexpr double kTimeBudgetSec = 40.0;  // Xano waits up to 120 s for the whole request
+        const auto started = std::chrono::steady_clock::now();
+
+        IntCurvesFace_ShapeIntersector inter;
+        inter.Load(shape, Precision::Confusion());
+
+        for (TopExp_Explorer exp(shape, TopAbs_FACE); exp.More(); exp.Next())
+        {
+            const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+            if (elapsed > kTimeBudgetSec)
+            {
+                r.complete = false;
+                break;
+            }
+
+            const TopoDS_Face face = TopoDS::Face(exp.Current());
+            GProp_GProps fp;
+            BRepGProp::SurfaceProperties(face, fp);
+            const double area = std::abs(fp.Mass());
+            if (area <= 0.0)
+                continue;
+
+            double u0, u1, v0, v1;
+            BRepTools::UVBounds(face, u0, u1, v0, v1);
+            if (!(u1 > u0) || !(v1 > v0))
+                continue;
+
+            const double target = std::max(4.0, kSampleBudget * area / totalAreaNative);
+            const int n = std::min(kMaxGridSide, std::max(2, static_cast<int>(std::ceil(std::sqrt(target)))));
+
+            BRepAdaptor_Surface surf(face, Standard_True);
+            BRepTopAdaptor_FClass2d inside(face, Precision::PConfusion());
+            std::vector<double> thickness;
+            thickness.reserve(static_cast<std::size_t>(n) * n);
+
+            for (int i = 0; i < n; ++i)
+            {
+                for (int j = 0; j < n; ++j)
+                {
+                    const double u = u0 + (i + 0.5) * (u1 - u0) / n;
+                    const double v = v0 + (j + 0.5) * (v1 - v0) / n;
+                    if (inside.Perform(gp_Pnt2d(u, v)) != TopAbs_IN)
+                        continue;
+
+                    BRepLProp_SLProps props(surf, u, v, 1, Precision::Confusion());
+                    if (!props.IsNormalDefined())
+                        continue;
+                    gp_Dir outward = props.Normal();
+                    if (face.Orientation() == TopAbs_REVERSED)
+                        outward.Reverse();
+
+                    // Nearest exit, ignoring re-hits of the starting face close to the start:
+                    // a real wall has two different faces, and the same face only comes back
+                    // legitimately across a feature (e.g. a pin's far side), which is far away.
+                    double t = -1.0; // -1: no exit within the largest band
+                    try
+                    {
+                        inter.Perform(gp_Lin(props.Value(), outward.Reversed()), startEps, maxRayNative);
+                        if (inter.IsDone())
+                        {
+                            for (int k = 1; k <= inter.NbPnt(); ++k)
+                            {
+                                const double w = inter.WParameter(k);
+                                if (w < sameFaceMinNative && inter.Face(k).IsSame(face))
+                                    continue;
+                                if (t < 0.0 || w < t)
+                                    t = w;
+                            }
+                        }
+                    }
+                    catch (...)
+                    {
+                        t = -1.0;
+                    }
+                    thickness.push_back(t);
+                }
+            }
+
+            if (thickness.empty())
+                continue;
+            const double weight = area / static_cast<double>(thickness.size());
+            r.sampledAreaNative += area;
+            for (double t : thickness)
+            {
+                ++r.samples;
+                if (t <= 0.0)
+                    continue;
+                if (r.minThicknessNative < 0.0 || t < r.minThicknessNative)
+                    r.minThicknessNative = t;
+                const double tIn = t * lengthToInches;
+                for (std::size_t b = 0; b < r.bandLimitsIn.size(); ++b)
+                    if (tIn < r.bandLimitsIn[b])
+                        r.bandAreaNative[b] += weight;
+            }
+        }
+
+        // Time budget hit: scale the sampled faces up to the whole part (reported via coverage).
+        if (!r.complete && r.sampledAreaNative > 0.0)
+        {
+            const double scale = totalAreaNative / r.sampledAreaNative;
+            for (double& a : r.bandAreaNative)
+                a *= scale;
+        }
+
+        r.ok = true;
+        return r;
+    }
+
     int countSubShapes(const TopoDS_Shape& shape, TopAbs_ShapeEnum type)
     {
         int count = 0;
@@ -960,6 +1116,19 @@ namespace
             holes.clear();
         }
 
+        ThinWallResult thinWalls;
+        if (solids > 0)
+        {
+            try
+            {
+                thinWalls = measureThinWalls(shape, lengthToInches, totalAreaNative);
+            }
+            catch (...)
+            {
+                thinWalls = ThinWallResult();
+            }
+        }
+
         if (cylCurv.sampleCount)
         {
             combinedCurv.sampleCount += cylCurv.sampleCount;
@@ -1186,7 +1355,38 @@ namespace
             if (h.through == 1) ++throughCount;
         json << "    \"hole_summary\": {\"count\": " << holes.size()
              << ", \"through\": " << throughCount
-             << ", \"detail\": \"see features.holes (analyze-step)\"}\n";
+             << ", \"detail\": \"see features.holes (analyze-step)\"},\n";
+        // Surface area by local wall thickness (both sides of a wall count). "area" uses the
+        // default 0.06 in cutoff; the backend picks the band matching its profile's cutoff.
+        if (thinWalls.ok)
+        {
+            constexpr double kDefaultThinCutoffIn = 0.06;
+            double defaultArea = 0.0;
+            for (std::size_t b = 0; b < thinWalls.bandLimitsIn.size(); ++b)
+                if (std::abs(thinWalls.bandLimitsIn[b] - kDefaultThinCutoffIn) < 1e-9)
+                    defaultArea = thinWalls.bandAreaNative[b] * in2;
+            json << "    \"thin_walls\": {\"cutoff_in\": " << kDefaultThinCutoffIn
+                 << ", \"area\": " << defaultArea
+                 << ", \"min_thickness_in\": ";
+            if (thinWalls.minThicknessNative > 0.0)
+                json << thinWalls.minThicknessNative * lengthToInches;
+            else
+                json << "null";
+            json << ", \"bands\": [";
+            for (std::size_t b = 0; b < thinWalls.bandLimitsIn.size(); ++b)
+            {
+                json << (b ? ", " : "") << "{\"max_thickness_in\": " << thinWalls.bandLimitsIn[b]
+                     << ", \"area\": " << thinWalls.bandAreaNative[b] * in2 << "}";
+            }
+            json << "], \"samples\": " << thinWalls.samples
+                 << ", \"complete\": " << (thinWalls.complete ? "true" : "false")
+                 << ", \"coverage\": " << (totalAreaNative > 0.0 ? thinWalls.sampledAreaNative / totalAreaNative : 0.0)
+                 << ", \"unit\": \"in^2\"}\n";
+        }
+        else
+        {
+            json << "    \"thin_walls\": null\n";
+        }
         json << "  },\n";
         json << "  \"face_type_distribution\": {\n";
         json << "    \"planar\": {\"count\": " << planarCount << ", \"percent\": " << percent(planarCount) << "},\n";
