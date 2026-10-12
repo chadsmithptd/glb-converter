@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+*.step
+*.stp
+*.SLDPRT
+*.sldprt
+.DS_Store

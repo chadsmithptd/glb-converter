@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y \
     libocct-modeling-algorithms-dev \
     libocct-data-exchange-dev \
     libocct-ocaf-dev \
+    python3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js 20

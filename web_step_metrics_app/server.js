@@ -234,6 +234,94 @@ app.post("/api/step-thumbnail", upload.single("stepFile"), async (req, res) => {
   }
 });
 
+// SolidWorks part -> STEP via the vendored pure-Python sldprt2step (vendor/sldprt2step, Apache-2.0).
+// It reads the Parasolid XT B-rep embedded in the .SLDPRT; no SolidWorks needed. The returned STEP
+// is meant to be fed back through /api/convert-step-to-glb, /api/analyze-step, etc. like any other.
+const SLDPRT2STEP_PATH = path.resolve(__dirname, "..", "vendor", "sldprt2step", "sldprt2step.py");
+// Address-space cap: the library decompresses zlib sections without a size ceiling.
+const SLDPRT_MEMORY_LIMIT_BYTES = 2 * 1024 * 1024 * 1024;
+// Blend-heavy parts are slow in pure Python; keep this under Xano's 180 s request timeout.
+const SLDPRT_TIMEOUT_MS = 170000;
+
+app.post("/api/convert-sldprt-to-step", upload.single("sldprtFile"), async (req, res) => {
+  let inputPath;
+  let workDir;
+
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded. Use form field 'sldprtFile'." });
+    }
+    inputPath = req.file.path;
+
+    const ext = path.extname(req.file.originalname || "").toLowerCase();
+    if (ext !== ".sldprt") {
+      return res.status(400).json({ error: "Only .sldprt files are allowed." });
+    }
+
+    // The converter names the STEP product after the input file, so give it the original name
+    // (sanitized) inside a per-request directory instead of multer's random one.
+    const baseName = (path.parse(req.file.originalname).name || "part").replace(/[^A-Za-z0-9._-]/g, "_");
+    workDir = await fs.promises.mkdtemp(path.join(uploadsDir, "sldprt-"));
+    const namedInput = path.join(workDir, `${baseName}.SLDPRT`);
+    const outputPath = path.join(workDir, `${baseName}.step`);
+    await fs.promises.rename(inputPath, namedInput);
+    inputPath = undefined;
+
+    // Exit 0 = ok, 2 = ok with approximations, 1 = typed failure; --json prints the result either
+    // way, so read stdout instead of relying on runProcess (which rejects on any non-zero exit).
+    const { code, stdout, stderr, timedOut } = await new Promise((resolve) => {
+      execFile(
+        "prlimit",
+        [`--as=${SLDPRT_MEMORY_LIMIT_BYTES}`, "--", "python3", "-I", "-S", "-B", SLDPRT2STEP_PATH, namedInput, "-o", outputPath, "--json"],
+        { timeout: SLDPRT_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 },
+        (err, out, errOut) => resolve({
+          code: err ? (typeof err.code === "number" ? err.code : -1) : 0,
+          stdout: out,
+          stderr: errOut,
+          timedOut: Boolean(err && err.killed)
+        })
+      );
+    });
+
+    if (timedOut) {
+      return res.status(422).json({ error: "SLDPRT conversion timed out", code: "timeout", message: `exceeded ${SLDPRT_TIMEOUT_MS / 1000} s` });
+    }
+
+    let result;
+    try {
+      result = JSON.parse(String(stdout).trim().split("\n").pop());
+    } catch (_) {
+      return res.status(500).json({ error: "sldprt2step returned no JSON result", exitCode: code, stderr: String(stderr).slice(-2000) });
+    }
+
+    if (!result.ok || (code !== 0 && code !== 2)) {
+      return res.status(422).json({ error: "SLDPRT conversion failed", code: result.error || "convert_failed", message: result.message || null });
+    }
+
+    const stepBuffer = await fs.promises.readFile(outputPath);
+    const warnings = Array.isArray(result.warnings) ? result.warnings : [];
+
+    res.setHeader("Content-Type", "application/step");
+    res.setHeader("Content-Disposition", `attachment; filename="${baseName}.step"`);
+    res.setHeader("Content-Length", stepBuffer.length);
+    // Small summary only (like X-Part-Metrics): warning texts can be long, so send kinds + count.
+    res.setHeader("Access-Control-Expose-Headers", "X-Sldprt-Conversion");
+    res.setHeader("X-Sldprt-Conversion", JSON.stringify({
+      exit_code: code,
+      solids: result.solids,
+      faces: result.faces,
+      warning_count: warnings.length,
+      warning_kinds: warnings.map((w) => String(w).split(":")[0]).slice(0, 10)
+    }));
+    return res.end(stepBuffer);
+  } catch (err) {
+    return sendProcessError(res, "SLDPRT conversion failed", err);
+  } finally {
+    cleanupFiles(inputPath);
+    if (workDir) fs.promises.rm(workDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
 const port = Number(process.env.PORT || 3000);
 app.listen(port, "0.0.0.0", () => {
   console.log(`Step Metrics Web App listening on port ${port}`);
