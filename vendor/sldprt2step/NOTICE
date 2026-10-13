@@ -1,0 +1,51 @@
+sldprt2step — .SLDPRT → STEP converter
+=================================================
+
+This package is a Python port of "open-sld-to-step", a clean-room
+Node.js/TypeScript library that parses Microsoft OLE Structured Storage in
+.SLDPRT files, extracts the internal Parasolid geometry streams, and
+translates them into ISO 10303 (STEP AP214) files.
+
+Origin and licence
+-------------------
+Upstream project : open-sld-to-step (version 0.1.0)
+Licence          : Apache License 2.0 (see LICENSE)
+This package     : a faithful, pure-Python 3.9 (standard library only) port of
+                   the upstream converter. No third-party runtime dependencies;
+                   no compiled or binary components.
+
+Clean-room / interoperability notice
+------------------------------------
+The upstream converter is a clean-room implementation developed for
+interoperability, written from public specifications and standards:
+
+  * The [MS-CFB] Compound File Binary File Format specification (Microsoft).
+  * The ISO 10303 (STEP) family of standards for product-data exchange.
+  * Public-domain technical references describing the Parasolid BRep model
+    topology (body -> lump -> shell -> face -> loop -> edge -> vertex).
+  * Observable byte-level structure of publicly available, non-restricted CAD
+    sample files (the NIST MBE PMI Validation and Conformance Testing data
+    sets, which are U.S. Government works in the public domain, 17 U.S.C. 105).
+
+No proprietary source code, header files, SDKs, or API documentation from
+Dassault Systemes, Siemens, or any other vendor has been used, referenced, or
+reverse-engineered in the development of the upstream converter or this port.
+
+Trademarks
+----------
+  * SolidWorks(R) is a registered trademark of Dassault Systemes SolidWorks
+    Corporation.
+  * Parasolid(R) is a registered trademark of Siemens Industry Software Inc.
+  * STEP (Standard for the Exchange of Product model data) is defined by
+    ISO 10303 and maintained by the International Organization for
+    Standardization (ISO).
+
+All other trademarks and trade names are the property of their respective
+owners and are used here solely for identification purposes.
+
+Disclaimer
+----------
+THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED. THE AUTHORS AND CONTRIBUTORS MAKE NO REPRESENTATIONS REGARDING THE
+ACCURACY OR COMPLETENESS OF ANY GEOMETRY CONVERSION PERFORMED BY THIS
+SOFTWARE. Conversion is partial; use at your own risk.
