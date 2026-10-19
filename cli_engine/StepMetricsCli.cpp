@@ -974,7 +974,9 @@ namespace
     // triangle-slab polygon (triangle corners inside the slab plus the edge crossings of the two
     // slab planes). The bore: where the axis itself is in air, everything inside the part's
     // smallest radius at that station is open bore (polygon corners again; chord sag is tiny).
-    // volume is the outer envelope with the bore still in it. Native units.
+    // Air on the axis comes from one line intersection plus a classification per interval.
+    // volume is the outer envelope with the bore still in it. Native units. Over the time
+    // budget it gives up (ok = false) so the request stays inside Xano's 120 s.
     struct TurnedEnvelope
     {
         bool   ok = false;
@@ -989,7 +991,14 @@ namespace
     TurnedEnvelope measureTurnedEnvelope(const TopoDS_Shape& shape, const gp_Pnt& axisPt, const gp_Dir& axisDir)
     {
         TurnedEnvelope out;
+        constexpr double kTimeBudgetSec = 15.0;
+        const auto started = std::chrono::steady_clock::now();
+        const auto overBudget = [&]() {
+            return std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() > kTimeBudgetSec;
+        };
         meshForExport(shape);
+        if (overBudget())
+            return out;
 
         struct Tri
         {
@@ -1051,8 +1060,11 @@ namespace
         const auto binOf = [&](double t) {
             return std::max(0, std::min(kBins - 1, static_cast<int>(std::floor((t - tMin) / w))));
         };
+        std::size_t triCount = 0;
         for (const Tri& tri : tris)
         {
+            if ((++triCount & 0xFFFF) == 0 && overBudget())
+                return out;
             const double lo = std::min({tri.t[0], tri.t[1], tri.t[2]});
             const double hi = std::max({tri.t[0], tri.t[1], tri.t[2]});
             for (int b = binOf(lo); b <= binOf(hi); ++b)
@@ -1095,14 +1107,41 @@ namespace
         }
         out.length = tMax - tMin;
 
+        // Where along the axis is air: cut the axis line with the part once, then classify one
+        // midpoint per interval between crossings (beyond the outermost crossings is air).
+        const double margin = 0.01 * out.length + w;
+        std::vector<double> cuts;
+        {
+            IntCurvesFace_ShapeIntersector inter;
+            inter.Load(shape, Precision::Confusion());
+            inter.Perform(gp_Lin(gp_Pnt(o + d * (tMin - margin)), axisDir), 0.0, out.length + 2.0 * margin);
+            if (!inter.IsDone())
+                return out;
+            for (int k = 1; k <= inter.NbPnt(); ++k)
+                cuts.push_back(tMin - margin + inter.WParameter(k));
+        }
+        std::sort(cuts.begin(), cuts.end());
+        const double cutTol = std::max(Precision::Confusion(), 1e-6 * out.length);
+        std::vector<double> marks;
+        for (const double c : cuts)
+            if (marks.empty() || c - marks.back() > cutTol)
+                marks.push_back(c);
         BRepClass3d_SolidClassifier classifier(shape);
-        const double classifyTol = std::max(Precision::Confusion(), 1e-6 * out.length);
+        std::vector<bool> intervalAir(marks.size() + 1, true);
+        for (std::size_t i = 1; i < marks.size(); ++i)
+        {
+            const gp_Pnt mid(o + d * (0.5 * (marks[i - 1] + marks[i])));
+            intervalAir[i] = classifyOut(classifier, mid, cutTol) == 1;
+        }
+
         for (int b = 0; b < kBins; ++b)
         {
             if (!std::isfinite(rMinBin[b]) || rMinBin[b] <= 0.0)
                 continue;
-            const gp_Pnt onAxis(o + d * (tMin + (b + 0.5) * w));
-            if (classifyOut(classifier, onAxis, classifyTol) != 1)
+            const double tc = tMin + (b + 0.5) * w;
+            const std::size_t interval = static_cast<std::size_t>(
+                std::upper_bound(marks.begin(), marks.end(), tc) - marks.begin());
+            if (!intervalAir[interval])
                 continue;
             const double r = std::min(rMinBin[b], rBin[b]);
             out.boreVolume += M_PI * r * r * w;
