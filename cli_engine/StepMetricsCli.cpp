@@ -54,7 +54,12 @@
 #include <gp_Pnt2d.hxx>
 #include <Bnd_Box.hxx>
 #include <GProp_GProps.hxx>
+#include <Geom_ConicalSurface.hxx>
 #include <Geom_CylindricalSurface.hxx>
+#include <Geom_SphericalSurface.hxx>
+#include <Geom_SurfaceOfRevolution.hxx>
+#include <Geom_ToroidalSurface.hxx>
+#include <Poly_Triangulation.hxx>
 #include <Geom_OffsetSurface.hxx>
 #include <Geom_RectangularTrimmedSurface.hxx>
 #include <Geom_Surface.hxx>
@@ -118,6 +123,16 @@ namespace
         double area = 0.0;
     };
 
+    // Cone / torus / sphere / revolved-curve face, collected during the face loop. It counts
+    // as turned (rotational) area only when it sits on the main axis line -- a tapered pin is
+    // mostly cone. A sphere has no axis of its own: only its centre (axis location) is used.
+    struct RevFaceInfo
+    {
+        gp_Ax1 axis;
+        bool   isSphere = false;
+        double area = 0.0;
+    };
+
     // Ubuntu OCCT headers only forward-declare gp_Cylinder, so adaptor.Cylinder()
     // cannot be used there. Pull the axis from the underlying Geom surface instead.
     bool cylindricalFaceAxis(const TopoDS_Face& face, gp_Ax1& axis)
@@ -131,6 +146,53 @@ namespace
             if (!cylinder.IsNull())
             {
                 axis = cylinder->Axis();
+                if (!loc.IsIdentity())
+                    axis.Transform(loc.Transformation());
+                return true;
+            }
+
+            Handle(Geom_RectangularTrimmedSurface) trimmed =
+                Handle(Geom_RectangularTrimmedSurface)::DownCast(surface);
+            if (!trimmed.IsNull())
+            {
+                surface = trimmed->BasisSurface();
+                continue;
+            }
+
+            Handle(Geom_OffsetSurface) offset =
+                Handle(Geom_OffsetSurface)::DownCast(surface);
+            if (!offset.IsNull())
+            {
+                surface = offset->BasisSurface();
+                continue;
+            }
+
+            return false;
+        }
+        return false;
+    }
+
+    // Axis of a cone, torus, sphere or surface-of-revolution face (same unwrapping as
+    // cylindricalFaceAxis). For a sphere the axis location is its centre and the direction
+    // means nothing (isSphere = true).
+    bool revolvedFaceAxis(const TopoDS_Face& face, gp_Ax1& axis, bool& isSphere)
+    {
+        isSphere = false;
+        TopLoc_Location loc;
+        Handle(Geom_Surface) surface = BRep_Tool::Surface(face, loc);
+        while (!surface.IsNull())
+        {
+            bool found = false;
+            Handle(Geom_ConicalSurface) cone = Handle(Geom_ConicalSurface)::DownCast(surface);
+            Handle(Geom_ToroidalSurface) torus = Handle(Geom_ToroidalSurface)::DownCast(surface);
+            Handle(Geom_SphericalSurface) sphere = Handle(Geom_SphericalSurface)::DownCast(surface);
+            Handle(Geom_SurfaceOfRevolution) revolution = Handle(Geom_SurfaceOfRevolution)::DownCast(surface);
+            if (!cone.IsNull())            { axis = cone->Axis(); found = true; }
+            else if (!torus.IsNull())      { axis = torus->Axis(); found = true; }
+            else if (!sphere.IsNull())     { axis = sphere->Axis(); isSphere = true; found = true; }
+            else if (!revolution.IsNull()) { axis = revolution->Axis(); found = true; }
+            if (found)
+            {
                 if (!loc.IsIdentity())
                     axis.Transform(loc.Transformation());
                 return true;
@@ -904,6 +966,192 @@ namespace
         mesher.Perform();
     }
 
+    // The solid a lathe leaves before any second (mill) op: the part's outer profile revolved
+    // about the turning axis, minus the bore it can cut down the middle. At each station along
+    // the axis the outer radius is the part's largest distance from the axis; summing pi r^2 dt
+    // over thin slabs gives the volume. Works on the face triangulation: distance from a line is
+    // convex, so within one slab a triangle's largest radius sits on a corner of the
+    // triangle-slab polygon (triangle corners inside the slab plus the edge crossings of the two
+    // slab planes). The bore: where the axis itself is in air, everything inside the part's
+    // smallest radius at that station is open bore (polygon corners again; chord sag is tiny).
+    // Air on the axis comes from one line intersection plus a classification per interval.
+    // volume is the outer envelope with the bore still in it. Native units. Over the time
+    // budget it gives up (ok = false) so the request stays inside Xano's 120 s.
+    struct TurnedEnvelope
+    {
+        bool   ok = false;
+        double volume = 0.0;
+        double maxRadius = 0.0;
+        double length = 0.0;
+        double boreVolume = 0.0;
+        double boreMaxRadius = 0.0;
+        double boreLength = 0.0;
+    };
+
+    TurnedEnvelope measureTurnedEnvelope(const TopoDS_Shape& shape, const gp_Pnt& axisPt, const gp_Dir& axisDir)
+    {
+        TurnedEnvelope out;
+        constexpr double kTimeBudgetSec = 15.0;
+        const auto started = std::chrono::steady_clock::now();
+        const auto overBudget = [&]() {
+            return std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() > kTimeBudgetSec;
+        };
+        meshForExport(shape);
+        if (overBudget())
+            return out;
+
+        struct Tri
+        {
+            double t[3];
+            gp_XYZ q[3];  // radial vector from the axis (linear along an edge, unlike its length)
+        };
+        std::vector<Tri> tris;
+        const gp_XYZ o = axisPt.XYZ();
+        const gp_XYZ d = axisDir.XYZ();
+        double tMin = std::numeric_limits<double>::infinity();
+        double tMax = -std::numeric_limits<double>::infinity();
+        constexpr std::size_t kMaxTriangles = 4000000;
+
+        for (TopExp_Explorer exp(shape, TopAbs_FACE); exp.More(); exp.Next())
+        {
+            const TopoDS_Face face = TopoDS::Face(exp.Current());
+            TopLoc_Location loc;
+            Handle(Poly_Triangulation) mesh = BRep_Tool::Triangulation(face, loc);
+            if (mesh.IsNull())
+                continue;
+            const bool moved = !loc.IsIdentity();
+            const gp_Trsf trsf = loc.Transformation();
+            for (Standard_Integer i = 1; i <= mesh->NbTriangles(); ++i)
+            {
+                if (tris.size() >= kMaxTriangles)
+                    return out;
+                Standard_Integer n[3];
+#if OCC_VERSION_HEX >= 0x070600
+                mesh->Triangle(i).Get(n[0], n[1], n[2]);
+#else
+                mesh->Triangles().Value(i).Get(n[0], n[1], n[2]);
+#endif
+                Tri tri;
+                for (int k = 0; k < 3; ++k)
+                {
+#if OCC_VERSION_HEX >= 0x070600
+                    gp_Pnt p = mesh->Node(n[k]);
+#else
+                    gp_Pnt p = mesh->Nodes().Value(n[k]);
+#endif
+                    if (moved)
+                        p.Transform(trsf);
+                    const gp_XYZ v = p.XYZ() - o;
+                    tri.t[k] = v.Dot(d);
+                    tri.q[k] = v - d * tri.t[k];
+                    tMin = std::min(tMin, tri.t[k]);
+                    tMax = std::max(tMax, tri.t[k]);
+                }
+                tris.push_back(tri);
+            }
+        }
+        if (tris.empty() || !(tMax > tMin))
+            return out;
+
+        constexpr int kBins = 1000;
+        const double w = (tMax - tMin) / kBins;
+        std::vector<double> rBin(kBins, 0.0);
+        std::vector<double> rMinBin(kBins, std::numeric_limits<double>::infinity());
+        const auto binOf = [&](double t) {
+            return std::max(0, std::min(kBins - 1, static_cast<int>(std::floor((t - tMin) / w))));
+        };
+        std::size_t triCount = 0;
+        for (const Tri& tri : tris)
+        {
+            if ((++triCount & 0xFFFF) == 0 && overBudget())
+                return out;
+            const double lo = std::min({tri.t[0], tri.t[1], tri.t[2]});
+            const double hi = std::max({tri.t[0], tri.t[1], tri.t[2]});
+            for (int b = binOf(lo); b <= binOf(hi); ++b)
+            {
+                const double s0 = tMin + b * w;
+                const double s1 = s0 + w;
+                double best = rBin[b];
+                double least = rMinBin[b];
+                for (int k = 0; k < 3; ++k)
+                {
+                    if (tri.t[k] >= s0 && tri.t[k] <= s1)
+                    {
+                        const double r = tri.q[k].Modulus();
+                        best = std::max(best, r);
+                        least = std::min(least, r);
+                    }
+                    const int k2 = (k + 1) % 3;
+                    const double ta = tri.t[k], tb = tri.t[k2];
+                    if (ta == tb)
+                        continue;
+                    for (const double s : {s0, s1})
+                    {
+                        if ((s - ta) * (s - tb) > 0.0)
+                            continue;
+                        const double f = (s - ta) / (tb - ta);
+                        const double r = (tri.q[k] * (1.0 - f) + tri.q[k2] * f).Modulus();
+                        best = std::max(best, r);
+                        least = std::min(least, r);
+                    }
+                }
+                rBin[b] = best;
+                rMinBin[b] = least;
+            }
+        }
+
+        for (const double r : rBin)
+        {
+            out.volume += M_PI * r * r * w;
+            out.maxRadius = std::max(out.maxRadius, r);
+        }
+        out.length = tMax - tMin;
+
+        // Where along the axis is air: cut the axis line with the part once, then classify one
+        // midpoint per interval between crossings (beyond the outermost crossings is air).
+        const double margin = 0.01 * out.length + w;
+        std::vector<double> cuts;
+        {
+            IntCurvesFace_ShapeIntersector inter;
+            inter.Load(shape, Precision::Confusion());
+            inter.Perform(gp_Lin(gp_Pnt(o + d * (tMin - margin)), axisDir), 0.0, out.length + 2.0 * margin);
+            if (!inter.IsDone())
+                return out;
+            for (int k = 1; k <= inter.NbPnt(); ++k)
+                cuts.push_back(tMin - margin + inter.WParameter(k));
+        }
+        std::sort(cuts.begin(), cuts.end());
+        const double cutTol = std::max(Precision::Confusion(), 1e-6 * out.length);
+        std::vector<double> marks;
+        for (const double c : cuts)
+            if (marks.empty() || c - marks.back() > cutTol)
+                marks.push_back(c);
+        BRepClass3d_SolidClassifier classifier(shape);
+        std::vector<bool> intervalAir(marks.size() + 1, true);
+        for (std::size_t i = 1; i < marks.size(); ++i)
+        {
+            const gp_Pnt mid(o + d * (0.5 * (marks[i - 1] + marks[i])));
+            intervalAir[i] = classifyOut(classifier, mid, cutTol) == 1;
+        }
+
+        for (int b = 0; b < kBins; ++b)
+        {
+            if (!std::isfinite(rMinBin[b]) || rMinBin[b] <= 0.0)
+                continue;
+            const double tc = tMin + (b + 0.5) * w;
+            const std::size_t interval = static_cast<std::size_t>(
+                std::upper_bound(marks.begin(), marks.end(), tc) - marks.begin());
+            if (!intervalAir[interval])
+                continue;
+            const double r = std::min(rMinBin[b], rBin[b]);
+            out.boreVolume += M_PI * r * r * w;
+            out.boreMaxRadius = std::max(out.boreMaxRadius, r);
+            out.boreLength += w;
+        }
+        out.ok = out.volume > 0.0;
+        return out;
+    }
+
     bool loadStepDocument(const std::string& inputPath,
                           Handle(TDocStd_Document)& doc,
                           TDF_LabelSequence& freeShapes)
@@ -1011,6 +1259,9 @@ namespace
         // Cylinder axes collected for rotational symmetry analysis
         std::vector<CylFaceAxisInfo> cylFaceAxes;
 
+        // Other surfaces of revolution; counted as rotational only when on the main axis line
+        std::vector<RevFaceInfo> revFaces;
+
         // Face-class areas for finishing estimates (native units): planar faces, analytic
         // curved faces (cylinder/cone/sphere/torus/revolution/extrusion = "contour"), and
         // free-form faces (B-spline/Bezier/offset/other = "generic").
@@ -1081,6 +1332,17 @@ namespace
                 }
                 case GeomAbs_Cone:     ++conCount;    appendCurvatureSamples(face, lengthToInches, conCurv); break;
                 default:               ++otherCount;  break;
+            }
+
+            if (surfType == GeomAbs_Cone || surfType == GeomAbs_Torus ||
+                surfType == GeomAbs_Sphere || surfType == GeomAbs_SurfaceOfRevolution)
+            {
+                RevFaceInfo info;
+                if (revolvedFaceAxis(face, info.axis, info.isSphere))
+                {
+                    info.area = faceArea;
+                    revFaces.push_back(info);
+                }
             }
 
             // Tool accessibility: planar faces are always reachable by large tools;
@@ -1234,6 +1496,9 @@ namespace
         gp_Dir      mainAxisDir(0.0, 0.0, 1.0);
         gp_Pnt      mainAxisPt(0.0, 0.0, 0.0);
         std::string dominantProcess  = "Milled";
+        double      coaxialRevAreaNative = 0.0;
+        double      rotAreaPercent   = cylAreaPercent;
+        gp_Pnt      coaxPt(0.0, 0.0, 0.0);
 
         if (dominantIdx >= 0 && totalCylAreaNative > 0.0)
         {
@@ -1270,15 +1535,87 @@ namespace
             // (a turned part's axis runs through or very near its CoM)
             const double proximityFactor = 1.0 / (1.0 + normDist * 4.0);
 
-            symConfidence = std::min(1.0, axisCoverage * (0.55 + 0.45 * proximityFactor));
+            // The main axis LINE = the largest-area cluster of collinear cylinder axes in the
+            // dominant direction (parallel off-axis holes would pull an average off the axis).
+            const double coaxTol = std::max(0.005 / lengthToInches, 0.005 * bsR);
+            const auto parallelToMain = [&](const gp_Dir& dir) {
+                const double ang = dir.Angle(mainAxisDir);
+                return std::min(ang, M_PI - ang) < kAxisAngleTolRad;
+            };
+            {
+                struct LineCluster { gp_Pnt ref; gp_XYZ locSum; double area; };
+                std::vector<LineCluster> lines;
+                for (const CylFaceAxisInfo& cfi : cylFaceAxes)
+                {
+                    if (!parallelToMain(cfi.axis.Direction()))
+                        continue;
+                    const gp_Pnt p = cfi.axis.Location();
+                    LineCluster* hit = nullptr;
+                    for (LineCluster& lc : lines)
+                        if (axisLineDistance(lc.ref, mainAxisDir, p) <= coaxTol) { hit = &lc; break; }
+                    if (!hit)
+                    {
+                        lines.push_back({p, gp_XYZ(0.0, 0.0, 0.0), 0.0});
+                        hit = &lines.back();
+                    }
+                    hit->locSum.Add(p.XYZ().Multiplied(cfi.area));
+                    hit->area += cfi.area;
+                }
+                const LineCluster* bestLine = nullptr;
+                for (const LineCluster& lc : lines)
+                    if (!bestLine || lc.area > bestLine->area)
+                        bestLine = &lc;
+                coaxPt = (bestLine && bestLine->area > 0.0)
+                    ? gp_Pnt(bestLine->locSum.Divided(bestLine->area)) : mainAxisPt;
+            }
 
-            hasStrongSym = (cylAreaPercent     >= 30.0)
-                        && (axisCoverage       >= 0.65)
+            // Cones, tori, spheres and revolved faces on that line are turned surfaces too.
+            // Only coaxial ones count, so fillets and countersinks elsewhere on a milled part
+            // don't make it look turned.
+            for (const RevFaceInfo& rf : revFaces)
+            {
+                if (axisLineDistance(coaxPt, mainAxisDir, rf.axis.Location()) > coaxTol)
+                    continue;
+                if (!rf.isSphere && !parallelToMain(rf.axis.Direction()))
+                    continue;
+                coaxialRevAreaNative += rf.area;
+            }
+            rotAreaPercent = (totalAreaNative > 0.0)
+                ? 100.0 * (totalCylAreaNative + coaxialRevAreaNative) / totalAreaNative : 0.0;
+            const double rotAxisCoverage =
+                (dom.areaSum + coaxialRevAreaNative) / (totalCylAreaNative + coaxialRevAreaNative);
+
+            symConfidence = std::min(1.0, rotAxisCoverage * (0.55 + 0.45 * proximityFactor));
+
+            hasStrongSym = (rotAreaPercent     >= 30.0)
+                        && (rotAxisCoverage    >= 0.65)
                         && (symConfidence      >= 0.45);
 
-            if      (cylAreaPercent >= 55.0 && symConfidence >= 0.65) dominantProcess = "Turned";
-            else if (cylAreaPercent <  15.0)                           dominantProcess = "Milled";
+            if      (rotAreaPercent >= 55.0 && symConfidence >= 0.65) dominantProcess = "Turned";
+            else if (rotAreaPercent <  15.0)                           dominantProcess = "Milled";
             else                                                        dominantProcess = "Hybrid";
+        }
+
+        // Turned envelope, only for parts that read as turned (it meshes the shape).
+        TurnedEnvelope turned;
+        if (hasStrongSym)
+        {
+            try
+            {
+                turned = measureTurnedEnvelope(shape, coaxPt, mainAxisDir);
+                if (turned.ok)
+                {
+                    // Mesh chords sit just inside curved faces: never report less than the part,
+                    // or more than the round bar it fits in.
+                    const double barVolume = M_PI * turned.maxRadius * turned.maxRadius * turned.length;
+                    turned.volume = std::min(std::max(turned.volume, volumeNative), barVolume);
+                    turned.boreVolume = std::min(turned.boreVolume, std::max(0.0, turned.volume - volumeNative));
+                }
+            }
+            catch (...)
+            {
+                turned = TurnedEnvelope();
+            }
         }
 
         const auto percent = [faces](int count) -> double {
@@ -1343,6 +1680,23 @@ namespace
              << mainAxisPt.X() * lengthToInches << ", "
              << mainAxisPt.Y() * lengthToInches << ", "
              << mainAxisPt.Z() * lengthToInches << "],\n";
+        json << "      \"rotational_area_percent\": " << rotAreaPercent << ",\n";
+        json << "      \"coaxial_revolved_area_percent\": "
+             << (totalAreaNative > 0.0 ? 100.0 * coaxialRevAreaNative / totalAreaNative : 0.0) << ",\n";
+        if (turned.ok)
+        {
+            const double in3 = lengthToInches * lengthToInches * lengthToInches;
+            json << "      \"turned_envelope\": {\"volume_in3\": " << turned.volume * in3
+                 << ", \"max_diameter_in\": " << 2.0 * turned.maxRadius * lengthToInches
+                 << ", \"length_in\": " << turned.length * lengthToInches
+                 << ", \"bore_volume_in3\": " << turned.boreVolume * in3
+                 << ", \"bore_max_diameter_in\": " << 2.0 * turned.boreMaxRadius * lengthToInches
+                 << ", \"bore_length_in\": " << turned.boreLength * lengthToInches << "},\n";
+        }
+        else
+        {
+            json << "      \"turned_envelope\": null,\n";
+        }
         json << "      \"dominant_process\": \"" << dominantProcess << "\"\n";
         json << "    },\n";
         const double in2 = lengthToInches * lengthToInches;
