@@ -58,3 +58,18 @@ Open `http://localhost:3000`.
   `suggested_type`. All lengths in inches. This list is top-level on purpose so it never goes
   into the HTTP header; read it from `/api/analyze-step`.
 
+## DWG drawings (`POST /api/convert-dwg-to-pdf`)
+
+Multipart field `dwgFile` (a `.dwg`, up to 50 MB). `output=pdf` (default) returns a PDF with one
+page per paper-space sheet (or one page of model space, drawn D-size) and a small `X-Dwg-Render`
+summary header; `output=text` returns JSON `{dxf_version, sheets, texts, text_truncated,
+audit_fixes}` with the drawing's own strings (title-block attributes as `TAG: value`).
+
+- `dwg2dxf` from LibreDWG 0.14 (GPL-3.0, built from the GNU tarball in the Dockerfile) converts
+  DWG to DXF; `dwg_render/render_dwg.py` (ezdxf 1.4.5 + matplotlib 3.10.9) draws and reads it.
+- Both parse untrusted files: each request gets its own directory (deleted afterwards), the tools
+  run under `prlimit` (2 GB address space, 512 MB file size), 60 s per step, as `DWG_RENDER_UID`
+  (user `dwgrender`, 10001, in the image) and with only `PATH`/`HOME`/`LANG`/`MPLCONFIGDIR` in
+  their environment. Neither makes network calls.
+- Local run: set `DWG2DXF_PATH` and `DWG_PYTHON` (a Python with ezdxf + matplotlib);
+  `DWG_MPLCONFIGDIR` optionally points at a prebuilt matplotlib font cache.
