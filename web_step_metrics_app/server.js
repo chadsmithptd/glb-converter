@@ -367,7 +367,11 @@ function runUntrusted(command, args, workDir) {
       PATH: process.env.PATH,
       HOME: workDir,
       LANG: "C.UTF-8",
-      MPLCONFIGDIR: path.join(workDir, "mpl")
+      MPLCONFIGDIR: path.join(workDir, "mpl"),
+      // numpy's bundled OpenBLAS reserves memory per CPU core at import; on a many-core host that
+      // alone can exceed the prlimit address-space cap.
+      OPENBLAS_NUM_THREADS: "1",
+      OMP_NUM_THREADS: "1"
     }
   };
   if (DWG_RUN_AS !== null) {

@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y \
     python3 \
     python3-venv \
     make \
+    fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 # DWG drawings (POST /api/convert-dwg-to-pdf). LibreDWG (GPL-3.0) is built from the GNU release
