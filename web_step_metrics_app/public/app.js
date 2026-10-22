@@ -1,6 +1,13 @@
 import * as THREE from "three";
 import { OrbitControls } from "/vendor/three/examples/jsm/controls/OrbitControls.js";
 
+// When the server enforces CONVERTER_API_KEY, open this page with ?key=<value>.
+const converterKey = new URLSearchParams(window.location.search).get("key") || "";
+
+function converterHeaders() {
+  return converterKey ? { "X-Converter-Key": converterKey } : {};
+}
+
 const form = document.getElementById("uploadForm");
 const output = document.getElementById("output");
 const statusEl = document.getElementById("status");
@@ -489,6 +496,7 @@ async function downloadGlb() {
 
   const res = await fetch("/api/convert-step-to-glb", {
     method: "POST",
+    headers: converterHeaders(),
     body: createStepFormData(stepFile)
   });
 
@@ -564,6 +572,7 @@ async function generateThumbnail() {
   } else {
     const res = await fetch("/api/step-thumbnail", {
       method: "POST",
+      headers: converterHeaders(),
       body: createStepFormData(stepFile, { width, height })
     });
 
@@ -631,6 +640,7 @@ form.addEventListener("submit", async (e) => {
 
     const res = await fetch("/api/analyze-step", {
       method: "POST",
+      headers: converterHeaders(),
       body: createStepFormData(stepFile)
     });
     const data = await res.json();

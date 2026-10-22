@@ -1,3 +1,4 @@
+const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const { execFile } = require("child_process");
@@ -9,6 +10,22 @@ const { renderThumbnail } = require("./thumbnail-renderer");
 
 const app = express();
 app.use(cors());
+
+// Shared-secret check for the conversion endpoints. When CONVERTER_API_KEY is set, every /api
+// request except /api/health must send the same value in the X-Converter-Key header. Unset means
+// open (the old behaviour), so callers can start sending the header before it is enforced.
+function keysMatch(given, expected) {
+  const a = Buffer.from(String(given || ""));
+  const b = Buffer.from(expected);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+app.use("/api", (req, res, next) => {
+  const expected = (process.env.CONVERTER_API_KEY || "").trim();
+  if (!expected || req.path === "/health" || req.method === "OPTIONS") return next();
+  if (keysMatch(req.get("X-Converter-Key"), expected)) return next();
+  return res.status(401).json({ error: "Missing or invalid X-Converter-Key header." });
+});
 app.use(express.json({ limit: "2mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 app.use("/vendor", express.static(path.join(__dirname, "node_modules")));
@@ -316,6 +333,169 @@ app.post("/api/convert-sldprt-to-step", upload.single("sldprtFile"), async (req,
     return res.end(stepBuffer);
   } catch (err) {
     return sendProcessError(res, "SLDPRT conversion failed", err);
+  } finally {
+    cleanupFiles(inputPath);
+    if (workDir) fs.promises.rm(workDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+// AutoCAD drawing (.dwg) -> PDF: LibreDWG's dwg2dxf (GPL-3.0, run as its own binary) converts the
+// DWG to DXF, then dwg_render/render_dwg.py (ezdxf + matplotlib) draws one PDF page per sheet and
+// lists the drawing's text. Both parse files from outside parties, so they run under resource limits
+// (prlimit), as DWG_RENDER_UID when set, with a minimal environment (no converter secrets), in a
+// per-request directory that is deleted afterwards. Neither needs the network.
+const DWG2DXF_PATH = process.env.DWG2DXF_PATH || "dwg2dxf";
+const DWG_PYTHON = process.env.DWG_PYTHON || "python3";
+const DWG_RENDER_PATH = path.resolve(__dirname, "..", "dwg_render", "render_dwg.py");
+const DWG_MAX_BYTES = 50 * 1024 * 1024;
+const DWG_STEP_TIMEOUT_MS = 60000;
+const DWG_MEMORY_LIMIT_BYTES = 2 * 1024 * 1024 * 1024;
+const DWG_FILE_SIZE_LIMIT_BYTES = 512 * 1024 * 1024;
+const DWG_RENDER_UID = Number.parseInt(process.env.DWG_RENDER_UID || "", 10);
+const DWG_RUN_AS = Number.isInteger(DWG_RENDER_UID) && process.getuid && process.getuid() === 0 ? DWG_RENDER_UID : null;
+const HAS_PRLIMIT = fs.existsSync("/usr/bin/prlimit");
+
+function runUntrusted(command, args, workDir) {
+  const [cmd, cmdArgs] = HAS_PRLIMIT
+    ? ["prlimit", [`--as=${DWG_MEMORY_LIMIT_BYTES}`, `--fsize=${DWG_FILE_SIZE_LIMIT_BYTES}`, "--", command, ...args]]
+    : [command, args];
+  const options = {
+    cwd: workDir,
+    timeout: DWG_STEP_TIMEOUT_MS,
+    maxBuffer: 8 * 1024 * 1024,
+    env: {
+      PATH: process.env.PATH,
+      HOME: workDir,
+      LANG: "C.UTF-8",
+      MPLCONFIGDIR: path.join(workDir, "mpl"),
+      // numpy's bundled OpenBLAS reserves memory per CPU core at import; on a many-core host that
+      // alone can exceed the prlimit address-space cap.
+      OPENBLAS_NUM_THREADS: "1",
+      OMP_NUM_THREADS: "1"
+    }
+  };
+  if (DWG_RUN_AS !== null) {
+    options.uid = DWG_RUN_AS;
+    options.gid = DWG_RUN_AS;
+  }
+  return new Promise((resolve) => {
+    execFile(cmd, cmdArgs, options, (err, stdout, stderr) => resolve({
+      code: err ? (typeof err.code === "number" ? err.code : -1) : 0,
+      stdout: String(stdout || ""),
+      stderr: String(stderr || ""),
+      timedOut: Boolean(err && err.killed)
+    }));
+  });
+}
+
+// POST multipart: dwgFile = the .dwg; output = "pdf" (default; the PDF body plus a small
+// X-Dwg-Render summary header) or "text" (JSON {dxf_version, sheets, texts, text_truncated,
+// audit_fixes} -- the drawing's own strings, too long for a header).
+app.post("/api/convert-dwg-to-pdf", upload.single("dwgFile"), async (req, res) => {
+  let inputPath;
+  let workDir;
+
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded. Use form field 'dwgFile'." });
+    }
+    inputPath = req.file.path;
+
+    const ext = path.extname(req.file.originalname || "").toLowerCase();
+    if (ext !== ".dwg") {
+      return res.status(400).json({ error: "Only .dwg files are allowed." });
+    }
+    if (req.file.size > DWG_MAX_BYTES) {
+      return res.status(413).json({ error: `DWG larger than ${DWG_MAX_BYTES / 1024 / 1024} MB.` });
+    }
+    const output = String(req.body?.output || req.query.output || "pdf").toLowerCase();
+    if (output !== "pdf" && output !== "text") {
+      return res.status(400).json({ error: "output must be 'pdf' or 'text'." });
+    }
+
+    // Every DWG starts with its version string, AC1009 (R12) .. AC1032 (2018+).
+    const handle = await fs.promises.open(inputPath, "r");
+    const header = Buffer.alloc(6);
+    await handle.read(header, 0, 6, 0);
+    await handle.close();
+    if (!/^AC1\d{3}$/.test(header.toString("latin1"))) {
+      return res.status(422).json({ error: "Not a DWG file", code: "not_dwg" });
+    }
+
+    // Fixed file names inside the work dir: the customer's file name never reaches a command line.
+    workDir = await fs.promises.mkdtemp(path.join(uploadsDir, "dwg-"));
+    const dwgPath = path.join(workDir, "input.dwg");
+    const dxfPath = path.join(workDir, "drawing.dxf");
+    const pdfPath = path.join(workDir, "drawing.pdf");
+    await fs.promises.rename(inputPath, dwgPath);
+    inputPath = undefined;
+    // matplotlib's font cache, prebuilt in the image, copied in per request: building it takes
+    // seconds, and the shared copy stays read-only to the render user.
+    const mplDir = path.join(workDir, "mpl");
+    await fs.promises.mkdir(mplDir);
+    if (process.env.DWG_MPLCONFIGDIR) {
+      await fs.promises.cp(process.env.DWG_MPLCONFIGDIR, mplDir, { recursive: true });
+    }
+    if (DWG_RUN_AS !== null) {
+      for (const p of [workDir, mplDir, ...(await fs.promises.readdir(mplDir)).map((f) => path.join(mplDir, f))]) {
+        await fs.promises.chown(p, DWG_RUN_AS, DWG_RUN_AS);
+      }
+      await fs.promises.chmod(dwgPath, 0o644);
+    }
+
+    // dwg2dxf logs many recoverable errors and its exit code is unreliable either way; the DXF
+    // it leaves behind is what decides.
+    const toDxf = await runUntrusted(DWG2DXF_PATH, ["-y", "-o", dxfPath, dwgPath], workDir);
+    if (toDxf.timedOut) {
+      return res.status(422).json({ error: "DWG conversion timed out", code: "timeout" });
+    }
+    const dxfStat = await fs.promises.stat(dxfPath).catch(() => null);
+    if (!dxfStat || dxfStat.size === 0) {
+      return res.status(422).json({ error: "DWG could not be read", code: "dwg_unreadable", exitCode: toDxf.code, stderr: toDxf.stderr.split(workDir).join("").slice(-1000) });
+    }
+
+    const render = await runUntrusted(DWG_PYTHON, ["-I", "-B", DWG_RENDER_PATH, dxfPath, output === "text" ? "-" : pdfPath], workDir);
+    if (render.timedOut) {
+      return res.status(422).json({ error: "DWG rendering timed out", code: "timeout" });
+    }
+    let result;
+    try {
+      result = JSON.parse(render.stdout.trim().split("\n").pop());
+    } catch (_) {
+      return res.status(500).json({ error: "render_dwg returned no JSON result", exitCode: render.code, stderr: render.stderr.split(workDir).join("").slice(-2000) });
+    }
+    if (!result.ok) {
+      return res.status(422).json({ error: "DWG rendering failed", code: result.error || "render_failed", message: result.message || null });
+    }
+
+    if (output === "text") {
+      return res.json({
+        dxf_version: result.dxf_version,
+        sheets: result.sheets,
+        texts: result.texts,
+        text_truncated: result.text_truncated,
+        audit_fixes: result.audit_fixes
+      });
+    }
+
+    const pdfBuffer = await fs.promises.readFile(pdfPath);
+    if (pdfBuffer.length < 5 || pdfBuffer.subarray(0, 5).toString("latin1") !== "%PDF-") {
+      return res.status(500).json({ error: "Renderer produced no PDF" });
+    }
+    const baseName = (path.parse(req.file.originalname).name || "drawing").replace(/[^A-Za-z0-9._-]/g, "_");
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="${baseName}.pdf"`);
+    res.setHeader("Content-Length", pdfBuffer.length);
+    res.setHeader("Access-Control-Expose-Headers", "X-Dwg-Render");
+    res.setHeader("X-Dwg-Render", JSON.stringify({
+      dxf_version: result.dxf_version,
+      sheet_count: result.sheets.length,
+      text_count: result.texts.length,
+      text_truncated: result.text_truncated
+    }));
+    return res.end(pdfBuffer);
+  } catch (err) {
+    return sendProcessError(res, "DWG conversion failed", err);
   } finally {
     cleanupFiles(inputPath);
     if (workDir) fs.promises.rm(workDir, { recursive: true, force: true }).catch(() => {});

@@ -24,6 +24,10 @@ Linux example:
 CLI_PATH=/opt/step-metrics/StepMetricsCli
 ```
 
+## Access key
+
+Set `CONVERTER_API_KEY` to require the header `X-Converter-Key: <value>` on every `/api/*` route except `/api/health` (401 otherwise). Leave it unset to keep the API open. The test page sends the key when opened as `/?key=<value>`.
+
 ## 3) Run
 
 ```bash
