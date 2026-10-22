@@ -1,3 +1,4 @@
+const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const { execFile } = require("child_process");
@@ -9,6 +10,22 @@ const { renderThumbnail } = require("./thumbnail-renderer");
 
 const app = express();
 app.use(cors());
+
+// Shared-secret check for the conversion endpoints. When CONVERTER_API_KEY is set, every /api
+// request except /api/health must send the same value in the X-Converter-Key header. Unset means
+// open (the old behaviour), so callers can start sending the header before it is enforced.
+function keysMatch(given, expected) {
+  const a = Buffer.from(String(given || ""));
+  const b = Buffer.from(expected);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+app.use("/api", (req, res, next) => {
+  const expected = (process.env.CONVERTER_API_KEY || "").trim();
+  if (!expected || req.path === "/health" || req.method === "OPTIONS") return next();
+  if (keysMatch(req.get("X-Converter-Key"), expected)) return next();
+  return res.status(401).json({ error: "Missing or invalid X-Converter-Key header." });
+});
 app.use(express.json({ limit: "2mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 app.use("/vendor", express.static(path.join(__dirname, "node_modules")));
