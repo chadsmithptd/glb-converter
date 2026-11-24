@@ -388,6 +388,61 @@ function runUntrusted(command, args, workDir) {
   });
 }
 
+// SolidWorks assembly/drawing structure (component tree, parts lists, title block, notes) read from
+// the XML inside .SLDASM / .SLDDRW (sw_structure/read_structure.py, standard library only). Returns
+// JSON; 422 when the file can't be read. Runs sandboxed like the DWG tools (runUntrusted).
+const SW_STRUCTURE_PATH = path.resolve(__dirname, "..", "sw_structure", "read_structure.py");
+const SW_STRUCTURE_MAX_BYTES = 100 * 1024 * 1024;
+
+app.post("/api/read-solidworks-structure", upload.single("solidworksFile"), async (req, res) => {
+  let inputPath;
+  let workDir;
+
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded. Use form field 'solidworksFile'." });
+    }
+    inputPath = req.file.path;
+
+    const ext = path.extname(req.file.originalname || "").toLowerCase();
+    if (ext !== ".sldasm" && ext !== ".slddrw") {
+      return res.status(400).json({ error: "Only .sldasm and .slddrw files are allowed." });
+    }
+    if (req.file.size > SW_STRUCTURE_MAX_BYTES) {
+      return res.status(413).json({ error: `File larger than ${SW_STRUCTURE_MAX_BYTES / 1024 / 1024} MB.` });
+    }
+
+    workDir = await fs.promises.mkdtemp(path.join(uploadsDir, "sw-"));
+    const namedInput = path.join(workDir, `input${ext}`);
+    await fs.promises.rename(inputPath, namedInput);
+    inputPath = undefined;
+    if (DWG_RUN_AS !== null) {
+      await fs.promises.chown(workDir, DWG_RUN_AS, DWG_RUN_AS);
+      await fs.promises.chown(namedInput, DWG_RUN_AS, DWG_RUN_AS);
+    }
+
+    const run = await runUntrusted("python3", ["-I", "-S", "-B", SW_STRUCTURE_PATH, namedInput], workDir);
+    if (run.timedOut) {
+      return res.status(422).json({ error: "Reading the SolidWorks file timed out", code: "timeout" });
+    }
+    let result;
+    try {
+      result = JSON.parse(String(run.stdout).trim().split("\n").pop());
+    } catch (_) {
+      return res.status(500).json({ error: "read_structure returned no JSON result", exitCode: run.code, stderr: run.stderr.split(workDir).join("").slice(-2000) });
+    }
+    if (!result.ok) {
+      return res.status(422).json({ error: "SolidWorks file could not be read", code: result.error, message: result.message || null });
+    }
+    return res.json(result);
+  } catch (err) {
+    return sendProcessError(res, "SolidWorks read failed", err);
+  } finally {
+    cleanupFiles(inputPath);
+    if (workDir) fs.promises.rm(workDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
 // POST multipart: dwgFile = the .dwg; output = "pdf" (default; the PDF body plus a small
 // X-Dwg-Render summary header) or "text" (JSON {dxf_version, sheets, texts, text_truncated,
 // audit_fixes} -- the drawing's own strings, too long for a header).
